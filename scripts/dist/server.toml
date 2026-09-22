@@ -1,0 +1,42 @@
+# rustnies server configuration.
+#
+# Installed by scripts/install.sh (stock copy refreshed to *.toml.dist).
+# Every field is optional: CLI flags override these, and a missing default
+# config file is ignored entirely. Edit this file, then (re)start the service.
+
+# UDP address to listen on for client handshakes and tunnel traffic.
+listen = "0.0.0.0:46722"
+
+# Server long-term static key (created by `keygen` if absent).
+key_path = "/var/lib/rustnies/server.key"
+
+# IPC socket the daemon listens on; `status`/`stop`/`ping` target this path.
+ipc_path = "/run/rustnies/rustnies.sock"
+
+# RUST_LOG-style filter (e.g. "info", "debug", "rustnies::tunnel=trace").
+log_level = "info"
+# log_level = "debug"
+# log_level = "rustnies::tunnel=debug,rustnies::fec=trace"
+# Optional: also write logs to this file (append mode). The parent directory
+# is created if it does not exist; if the file cannot be opened, logging
+# falls back to stdout-only.
+# log_file = "/var/log/rustnies/server.log"
+
+[tun]
+name = "rustnies"
+addr = "10.7.0.1"
+prefix = 24
+mtu = 1400
+
+[nat]
+# Masquerade tunneled traffic out of the host's real interface.
+enabled = true
+# out_iface = "eth0"   # auto-detected when unset
+
+# Restrict handshakes to known client public keys. With no [[peers]] section
+# the server accepts every peer (open mode). To lock it down, list the hex
+# public keys produced by `rustnies keygen --key <client.key>` on each client:
+#
+# [[peers]]
+# public_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# name = "alice"

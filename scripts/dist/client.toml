@@ -1,0 +1,47 @@
+# rustnies client configuration.
+#
+# Installed by scripts/install.sh (stock copy refreshed to *.toml.dist).
+# `server` and `server_key` MUST be set before the client can connect.
+# Edit this file, then (re)start the service.
+
+# The server's UDP endpoint.
+server = "127.0.0.1:46722"
+
+# The server's static public key (64 hex chars). On the server run
+# `rustnies pubkey --key /var/lib/rustnies/server.key` (or read its .pub
+# sidecar) to get this value, then paste it here. For a remote server, use
+# that server's public key.
+server_key = "REPLACE_WITH_SERVER_PUBKEY_HEX"
+
+# Client long-term static key (created by `keygen` if absent).
+key_path = "/var/lib/rustnies/client.key"
+
+# IPC socket the daemon listens on; `status`/`stop`/`ping` target this path.
+ipc_path = "/run/rustnies/rustnies.sock"
+
+# RUST_LOG-style filter.
+log_level = "info"
+# log_level = "debug"
+# log_level = "rustnies::tunnel=debug,rustnies::fec=trace"
+# Optional: also write logs to this file (append mode). The parent directory
+# is created if it does not exist; if the file cannot be opened, logging
+# falls back to stdout-only.
+# log_file = "/var/log/rustnies/client.log"
+
+[tun]
+name = "rustnies0"
+addr = "10.7.0.2"
+prefix = 24
+mtu = 1400
+
+# Route all traffic through the tunnel (replaces the default route; a host
+# route to the server via the original gateway is added first to avoid loops).
+# route_all = true
+# Keep retrying after a disconnect (exponential backoff).
+# reconnect = true
+# Block DNS from leaking out the real interface and rewrite /etc/resolv.conf.
+# dns_leak_protection = true
+# Resolver IPs written to /etc/resolv.conf while the tunnel is up.
+# dns = ["1.1.1.1"]
+# Fail closed: block all non-tunnel traffic if the tunnel drops.
+# kill_switch = false

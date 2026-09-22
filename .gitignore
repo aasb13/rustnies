@@ -1,0 +1,62 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Keep Cargo.lock in version control: this repo ships a binary (`src/main.rs`),
+# so the locked dependency tree is part of the reproducible build.
+# Do NOT add Cargo.lock here.
+
+# Release / packaging artifacts (see .github/workflows/release.yml).
+# The `rustnies.zip` snapshot previously committed at the repo root is one
+# of these and is intentionally untracked.
+*.tar.gz
+*.zip
+*.sha256
+
+# Secrets and local runtime state. Keys are created with
+# `rustnies keygen --key <path>`; there is no default key path.
+*.key
+*.pem
+*.p12
+*.pfx
+.env
+.env.*
+
+# Local config overrides (production files live in /etc/rustnies/ or are
+# passed via --config; never commit machine-specific copies).
+*.local.toml
+
+# Crash / backup / editor droppings
+*.log
+*.bak
+*.orig
+*~
+*.swp
+*.swo
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# IDEs and language servers
+.vscode/
+.idea/
+*.iml
+rust-analyzer*.log
+
+# Coverage and profiling
+/coverage/
+lcov.info
+*.profdata
+*.profraw
+perf.data
+perf.data.old
+flamegraph.svg
+
+# AI assistants and local tooling (never commit session state)
+.omo/
+.crush/
+.opencode/
+.claude/
+.opencode-tool-output/

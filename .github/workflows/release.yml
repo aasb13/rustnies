@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and publish release artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          if command -v rustup >/dev/null 2>&1; then
+            rustup toolchain install stable --profile minimal
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Verify test suite
+        run: cargo test --locked --all
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Stage artifact
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          ARCHIVE="rustnies-${TAG}-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/${ARCHIVE}"
+          # Strip debug symbols for a smaller, shippable binary.
+          strip target/release/rustnies
+          cp target/release/rustnies "dist/${ARCHIVE}/rustnies"
+          cp README.md "dist/${ARCHIVE}/README.md"
+          cp -R scripts "dist/${ARCHIVE}/scripts"
+          tar -C dist -czf "${ARCHIVE}.tar.gz" "${ARCHIVE}"
+          sha256sum "${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256"
+          echo "Artifact:"
+          ls -la "${ARCHIVE}.tar.gz" "${ARCHIVE}.tar.gz.sha256"
+
+      # GitHub-native release: creates (or updates) the GitHub Release for
+      # this tag and uploads the artifacts. Uses the auto-provided
+      # GITHUB_TOKEN (contents: write above); no extra secrets needed.
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rustnies-*-x86_64-unknown-linux-gnu.tar.gz
+            rustnies-*-x86_64-unknown-linux-gnu.tar.gz.sha256
+          generate_release_notes: true

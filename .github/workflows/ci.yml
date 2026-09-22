@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Cancel a superseded run when a new commit lands on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The project rule is "cargo build must be warning-free"; enforce it in CI.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          if command -v rustup >/dev/null 2>&1; then
+            rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --component rustfmt,clippy
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: rustup show
+        run: rustup show
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      # clippy is advisory for now: the codebase has existing lint debt
+      # (mostly in the Reed-Solomon GF(256) math and the platform layer)
+      # that should be cleaned up deliberately, not by an auto-fix sweep.
+      # Reports lints without blocking the pipeline; tighten to a hard gate
+      # once the debt is gone by removing `continue-on-error`.
+      - name: cargo clippy (advisory)
+        continue-on-error: true
+        run: cargo clippy --all-targets -- -D warnings
+
+  build-and-test:
+    name: build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          if command -v rustup >/dev/null 2>&1; then
+            rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --component rustfmt,clippy
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Best-effort cargo cache; a missing cache backend must not break the build.
+      - name: Cache cargo
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: cargo build (warning-free)
+        run: cargo build --all-targets --locked
+
+      - name: cargo test
+        run: cargo test --locked --all

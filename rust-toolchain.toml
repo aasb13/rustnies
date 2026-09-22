@@ -1,0 +1,6 @@
+# Pin the Rust toolchain for local dev and CI so edition 2024 (Rust >= 1.85)
+# builds are reproducible. `cargo`/`rustup` auto-install this toolchain the
+# first time it is needed in this repo.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
