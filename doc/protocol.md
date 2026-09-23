@@ -45,8 +45,26 @@ Constants live in `src/protocol/header.rs`:
 
 - `PROTOCOL_VERSION = 0x01`
 - `HEADER_LEN = 24`
-- `MAX_PAYLOAD = 1400 - HEADER_LEN - 16` (room for header + AEAD tag within a
-  1400-byte TUN MTU, avoiding IP fragmentation).
+- `AEAD_TAG_LEN = 16` (ChaCha20-Poly1305 tag per datagram)
+- `OUTER_OVERHEAD = 28` (UDP 8 + IPv4 20 on the wire; IPv6 outers cost 48)
+- `PATH_MTU = 1500` (assumed path MTU for the outer UDP datagrams)
+- `MAX_PAYLOAD = 1400 - HEADER_LEN - AEAD_TAG_LEN` (1360: largest TUN payload
+  per Data datagram)
+
+Wire budget for a full-size payload with the default 1400-byte TUN MTU:
+
+```text
+1360 (payload) + 24 (header) + 16 (AEAD tag) + 8 (UDP) + 20 (IPv4) = 1428
+```
+
+That stays under the 1500-byte path MTU with ~70 bytes of margin for PPPoE,
+carrier encapsulation, an IPv6 outer (+20), or a small transport tag. The
+daemon additionally clamps the TUN device MTU to `MAX_PAYLOAD` so the kernel
+hands us only wire-safe inner packets, and the tunnel drops anything larger
+(counted in `tx_dropped_mtu`) as a safety net for FD-backed devices. The
+padding obfuscation layer's default top bucket is 1400 for the same reason:
+a 1500-byte bucket would force a 1528-byte outer datagram on every
+full-size frame.
 
 ### Header flags
 

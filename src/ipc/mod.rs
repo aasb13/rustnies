@@ -317,10 +317,11 @@ pub fn format_stats(s: &Stats) -> String {
     );
     let _ = writeln!(
         out,
-        "pacing:    {:.0} kbit/s ({} paced, {} dropped-congestion)",
+        "pacing:    {:.0} kbit/s ({} paced, {} dropped-congestion, {} dropped-mtu)",
         s.pacing_rate * 8.0 / 1000.0,
         s.tx_paced,
-        s.tx_dropped_congestion
+        s.tx_dropped_congestion,
+        s.tx_dropped_mtu
     );
     let _ = writeln!(out, "rtt samples:  {}", s.rtt_samples);
 

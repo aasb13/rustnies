@@ -137,6 +137,7 @@ calls `Counters::snapshot()` and returns the resulting `Stats`.
 | `sessions_evicted` | u64 | Sessions evicted by the session cap. |
 | `sessions_roamed` | u64 | Sessions rebound to a new client address. |
 | `tx_dropped_congestion` | u64 | Packets dropped because the window was full. |
+| `tx_dropped_mtu` | u64 | Packets dropped for exceeding the wire-safe budget (oversize TUN payload or post-obfuscation datagram past the path MTU). |
 | `tx_paced` | u64 | Packets held by the pacer (rate-limited, not dropped). |
 | `rtt_samples` | u64 | Delivered packets whose RTT was fed to the controller. |
 

@@ -42,6 +42,20 @@ const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Upper bound for the client reconnection backoff.
 const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Clamp a configured TUN MTU to the largest value whose full-size inner
+/// packets still fit the wire-safe payload budget without outer fragmentation.
+///
+/// The device MTU is the inner IP packet size the OS may hand us; the tunnel
+/// adds `HEADER_LEN + AEAD_TAG_LEN` per datagram. Values at or below
+/// `MAX_PAYLOAD` pass through unchanged; larger ones (including the legacy
+/// 1400 default) are clamped to `MAX_PAYLOAD` so the kernel fragments the
+/// *inner* packet (which the peer reassembles losslessly) instead of us
+/// emitting an *outer* UDP datagram the path must fragment or drop.
+pub fn effective_tun_mtu(configured: u32) -> u32 {
+    let cap = crate::protocol::header::MAX_PAYLOAD as u32;
+    configured.min(cap).max(576)
+}
+
 /// Run the client daemon. The TUN device and route rules are brought up once
 /// and kept alive for the lifetime of the daemon; only the UDP session is
 /// re-established on disconnect. With `reconnect` enabled (the default), a
@@ -112,12 +126,22 @@ pub async fn run_client(mut cfg: ClientConfig) -> std::io::Result<()> {
         .tun_addr6
         .as_ref()
         .map(|addr| (addr.as_str(), cfg.tun_prefix6.unwrap_or(64)));
+    // Clamp the device MTU to the wire-safe payload budget so the OS never
+    // hands us an inner packet that would fragment the outer UDP datagram.
+    let device_mtu = effective_tun_mtu(cfg.tun_mtu);
+    if device_mtu != cfg.tun_mtu {
+        tracing::info!(
+            configured = cfg.tun_mtu,
+            effective = device_mtu,
+            "clamping TUN MTU to wire-safe payload budget"
+        );
+    }
     let mut tun = factory.build(
         &cfg.tun_name,
         &cfg.tun_addr,
         cfg.tun_prefix,
         tun_v6,
-        cfg.tun_mtu,
+        device_mtu,
     )?;
     tracing::info!(tun = ?tun.name(), "TUN up (client)");
 
@@ -557,12 +581,20 @@ pub async fn run_server(cfg: ServerConfig) -> std::io::Result<()> {
         .tun_addr6
         .as_ref()
         .map(|addr| (addr.as_str(), cfg.tun_prefix6.unwrap_or(64)));
+    let device_mtu = effective_tun_mtu(cfg.tun_mtu);
+    if device_mtu != cfg.tun_mtu {
+        tracing::info!(
+            configured = cfg.tun_mtu,
+            effective = device_mtu,
+            "clamping TUN MTU to wire-safe payload budget"
+        );
+    }
     let tun = factory.build(
         &cfg.tun_name,
         &cfg.tun_addr,
         cfg.tun_prefix,
         tun_v6,
-        cfg.tun_mtu,
+        device_mtu,
     )?;
     tracing::info!(tun = ?tun.name(), "TUN up (server, shared by all clients)");
 
@@ -1103,5 +1135,21 @@ mod tests {
             cidr_base_v6("2001:db8:1234:5678::1", 64),
             "2001:db8:1234:5678::"
         );
+    }
+
+    #[test]
+    fn effective_tun_mtu_clamps_to_wire_safe_payload() {
+        use crate::protocol::header::MAX_PAYLOAD;
+        // The legacy 1400 default exceeds the payload budget and must clamp.
+        assert_eq!(super::effective_tun_mtu(1400), MAX_PAYLOAD as u32);
+        // Larger values clamp the same way; smaller ones pass through.
+        assert_eq!(super::effective_tun_mtu(9000), MAX_PAYLOAD as u32);
+        assert_eq!(super::effective_tun_mtu(1280), 1280);
+        assert_eq!(
+            super::effective_tun_mtu(MAX_PAYLOAD as u32),
+            MAX_PAYLOAD as u32
+        );
+        // Degenerate tiny values floor at the minimum IP MTU instead of zero.
+        assert_eq!(super::effective_tun_mtu(0), 576);
     }
 }

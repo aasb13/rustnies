@@ -63,12 +63,17 @@ pub struct PeerEntry {
 /// ```toml
 /// [obfuscation]
 /// layers = ["padding", "header_xor"]   # ordered; applied in order on send
-/// padding_buckets = [64, 128, 256, 512, 1024, 1500]
-/// padding_max = 1500
+/// padding_buckets = [64, 128, 256, 512, 1024, 1400]
+/// padding_max = 1400
 /// timing_max_jitter_us = 2000
 /// timing_decoy_interval_ms = 200
 /// timing_decoy_max_len = 256
 /// ```
+///
+/// Buckets are measured in bytes at the padded output (incl. the 2-byte length
+/// prefix). Keep the top bucket wire-safe: bucket + UDP/IPv4 envelope (28 B)
+/// must fit the 1500-byte path MTU, so 1400 is the default ceiling — a 1500
+/// bucket would emit 1528-byte outer datagrams that fragment on Ethernet.
 ///
 /// Unknown layer names in `layers` are logged at `warn` and skipped, so a typo
 /// never prevents the tunnel from coming up. The recognised layer names are:

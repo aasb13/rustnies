@@ -77,6 +77,13 @@ pub struct Stats {
     /// non-zero rate here means the app is offering more than the path can
     /// take; the tunnel drops rather than queueing so latency stays bounded.
     pub tx_dropped_congestion: u64,
+    /// Best-effort data/parity packets dropped because they would exceed the
+    /// wire-safe budget (`MAX_PAYLOAD` on the TUN payload, or the path MTU
+    /// after obfuscation/transport expansion). A sustained non-zero rate here
+    /// means the TUN device is handing us packets larger than the tunnel can
+    /// carry without outer fragmentation (misconfigured MTU) or a custom
+    /// padding bucket is oversized.
+    pub tx_dropped_mtu: u64,
     /// Data packets the sender held back for the pacer (rate limiter), as
     /// opposed to dropping. These are *not* lost: they are re-queued behind
     /// newer packet arrivals on the next send readiness. A high count simply
@@ -130,6 +137,7 @@ pub struct Counters {
     pub sessions_roamed: u64,
     pub dispatch_backpressure: u64,
     pub tx_dropped_congestion: u64,
+    pub tx_dropped_mtu: u64,
     pub tx_paced: u64,
     pub rtt_samples: u64,
     pub pacing_rate: f64,
@@ -174,6 +182,7 @@ impl Counters {
             sessions_roamed: 0,
             dispatch_backpressure: 0,
             tx_dropped_congestion: 0,
+            tx_dropped_mtu: 0,
             tx_paced: 0,
             rtt_samples: 0,
             pacing_rate: 0.0,
@@ -216,6 +225,7 @@ impl Counters {
             sessions_roamed: self.sessions_roamed,
             dispatch_backpressure: self.dispatch_backpressure,
             tx_dropped_congestion: self.tx_dropped_congestion,
+            tx_dropped_mtu: self.tx_dropped_mtu,
             tx_paced: self.tx_paced,
             rtt_samples: self.rtt_samples,
             pacing_rate: self.pacing_rate,

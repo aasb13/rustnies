@@ -27,9 +27,42 @@ pub const PROTOCOL_VERSION: u8 = 0x01;
 /// Total header length in bytes.
 pub const HEADER_LEN: usize = 24;
 
-/// Maximum payload carried by a single packet. With a 1400-byte TUN MTU this
-/// leaves room for the header and AEAD tag without IP fragmentation.
-pub const MAX_PAYLOAD: usize = 1400 - HEADER_LEN - 16;
+/// Length of the ChaCha20-Poly1305 authentication tag appended to every
+/// encrypted payload.
+pub const AEAD_TAG_LEN: usize = 16;
+
+/// Outer UDP header carried on the wire for every datagram.
+pub const UDP_HEADER_LEN: usize = 8;
+/// Outer IPv4 header carried on the wire for every datagram (IPv6 paths add
+/// a further 20 bytes; see the margin discussion on [`MAX_PAYLOAD`]).
+pub const IPV4_HEADER_LEN: usize = 20;
+/// Outer L3/L4 envelope: UDP + IPv4. An IPv6 outer path costs 48 bytes
+/// instead of 28; the [`MAX_PAYLOAD`] margin below still covers that.
+pub const OUTER_OVERHEAD: usize = UDP_HEADER_LEN + IPV4_HEADER_LEN;
+/// Assumed path MTU for the encrypted UDP datagrams. Standard Ethernet is
+/// 1500; PPPoE (-8), carrier encapsulation, or a second VPN hop shrink it,
+/// which is why [`MAX_PAYLOAD`] keeps a ~70-byte margin under this budget.
+pub const PATH_MTU: usize = 1500;
+
+/// Maximum TUN payload (inner IP packet) carried in a single Data datagram.
+///
+/// Wire budget for a full-size payload with the default 1400-byte TUN MTU:
+///
+/// ```text
+///   1360 (payload) + 24 (header) + 16 (AEAD tag) + 8 (UDP) + 20 (IPv4) = 1428
+/// ```
+///
+/// That stays under the 1500-byte [`PATH_MTU`] with ~70 bytes of margin for
+/// PPPoE, carrier encapsulation, an IPv6 outer (extra 20), or a small
+/// transport tag. It does NOT cover a 1500-byte padding bucket, which is why
+/// the padding layer's default top bucket must stay at or below the frame
+/// size for a full payload (see `obfuscation::padding`).
+///
+/// The TUN device itself is configured with a matching MTU (see the daemon's
+/// effective-MTU clamp) so the OS never hands us an inner packet larger than
+/// this; [`crate::tunnel`] additionally drops anything larger as a safety
+/// net for FD-backed / misconfigured devices.
+pub const MAX_PAYLOAD: usize = 1400 - HEADER_LEN - AEAD_TAG_LEN;
 
 /// 4-byte opaque session identifier.
 pub type SessionId = u32;

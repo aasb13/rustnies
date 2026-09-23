@@ -67,8 +67,11 @@ The `[obfuscation]` TOML section:
 layers = ["padding", "header_xor"]
 
 # [padding] parameters
-padding_buckets = [64, 128, 256, 512, 1024, 1500]  # output sizes (incl. 2B prefix)
-padding_max = 1500                                   # hard cap on output size
+padding_buckets = [64, 128, 256, 512, 1024, 1400]  # output sizes (incl. 2B prefix)
+padding_max = 1400                                   # hard cap on output size
+# NOTE: the top bucket must stay wire-safe: bucket + UDP/IPv4 envelope (28B)
+# must fit the 1500-byte path MTU. A 1500 bucket yields 1528-byte datagrams
+# that fragment on standard Ethernet, so 1400 is the default ceiling.
 
 # [timing] parameters
 timing_max_jitter_us = 2000      # 0-2ms random send delay

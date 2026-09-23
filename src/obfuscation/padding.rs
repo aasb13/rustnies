@@ -20,8 +20,8 @@
 //! ```toml
 //! [obfuscation]
 //! layers = ["padding"]
-//! padding_buckets = [64, 128, 256, 512, 1024, 1500]
-//! padding_max = 1500
+//! padding_buckets = [64, 128, 256, 512, 1024, 1400]
+//! padding_max = 1400
 //! ```
 //!
 //! `padding_buckets` is the sorted list of bucket sizes (in bytes, measured at
@@ -32,7 +32,13 @@
 //! `padding_max` is rejected on apply — but in practice the transport MTU
 //! keeps frames well under any reasonable `padding_max`).
 //!
-//! Defaults: buckets `[128, 256, 512, 1024, 1500]`, max 1500.
+//! Defaults: buckets `[128, 256, 512, 1024, 1400]`, max 1400.
+//!
+//! The default top bucket is deliberately *not* 1500: a 1500-byte padded frame
+//! plus the outer UDP/IPv4 envelope (28 bytes) is a 1528-byte IP datagram,
+//! guaranteed to fragment on a 1500-byte path. 1400 keeps the worst-case wire
+//! datagram (~1430 with envelope and transport tag) under the path MTU with
+//! margin for PPPoE, carrier encapsulation, or an IPv6 outer.
 
 use super::{ObfuscationError, ObfuscationLayer};
 
@@ -40,9 +46,13 @@ use super::{ObfuscationError, ObfuscationLayer};
 const LEN_PREFIX: usize = 2;
 
 /// Default bucket sizes (bytes, inclusive of the 2-byte length prefix).
-const DEFAULT_BUCKETS: [usize; 5] = [128, 256, 512, 1024, 1500];
-/// Default maximum output size.
-const DEFAULT_MAX: usize = 1500;
+/// The top bucket is bounded by the largest wire-safe frame size: a 1400-byte
+/// padded frame plus the outer UDP/IPv4 envelope stays under the 1500-byte path
+/// MTU (see [`crate::protocol::header::PATH_MTU`]).
+const DEFAULT_BUCKETS: [usize; 5] = [128, 256, 512, 1024, 1400];
+/// Default maximum output size, chosen so the largest padded frame plus the
+/// outer envelope never exceeds the path MTU.
+const DEFAULT_MAX: usize = 1400;
 
 /// A size-padding obfuscation layer.
 ///
@@ -178,6 +188,31 @@ mod tests {
         assert_eq!(out.len(), 256);
         let rev = p.reverse(&out).unwrap();
         assert_eq!(rev, frame);
+    }
+
+    #[test]
+    fn default_top_bucket_stays_wire_safe() {
+        // Worst case: a full-size frame padded into the top default bucket,
+        // plus the outer UDP/IPv4 envelope, must stay under the path MTU.
+        // (A full-size frame is 1402 bytes with the length prefix, which
+        // exceeds the 1400 top bucket and goes out unpadded — also covered.)
+        use crate::protocol::header::{OUTER_OVERHEAD, PATH_MTU};
+        let top = DEFAULT_BUCKETS.iter().copied().max().unwrap();
+        assert!(
+            top + OUTER_OVERHEAD <= PATH_MTU,
+            "top bucket {top} + envelope {OUTER_OVERHEAD} must fit path MTU {PATH_MTU}"
+        );
+        assert!(DEFAULT_MAX + OUTER_OVERHEAD <= PATH_MTU);
+        // And a max-size frame really does fit through apply unchanged enough
+        // to stay under budget: full payload frame -> unpadded prefix output.
+        use crate::protocol::header::{AEAD_TAG_LEN, HEADER_LEN, MAX_PAYLOAD};
+        let full_frame = MAX_PAYLOAD + HEADER_LEN + AEAD_TAG_LEN;
+        let out = SizePadding::default().apply(&vec![0xAB; full_frame]);
+        assert!(
+            out.len() + OUTER_OVERHEAD <= PATH_MTU,
+            "full-size padded frame {} + envelope must fit path MTU",
+            out.len()
+        );
     }
 
     #[test]

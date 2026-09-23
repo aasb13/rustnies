@@ -29,7 +29,7 @@ use crate::fec::reed_solomon::ReedSolomon;
 use crate::obfuscation::{ObfuscationStack, is_decoy_frame};
 use crate::protocol::SessionId;
 use crate::protocol::codec;
-use crate::protocol::header::{PacketHeader, PacketType};
+use crate::protocol::header::{MAX_PAYLOAD, OUTER_OVERHEAD, PATH_MTU, PacketHeader, PacketType};
 use crate::protocol::session::Session;
 use crate::stats::Counters;
 use crate::transport::Transport;
@@ -654,6 +654,21 @@ impl Tunnel {
     /// Returns `false` when the packet was deliberately not sent (window full
     /// or the pacer holding it back), so the caller can keep or re-queue it.
     async fn handle_tun_packet(&mut self, packet: Vec<u8>) -> bool {
+        // Wire-safety gate. A TUN payload larger than MAX_PAYLOAD would push
+        // the outer UDP datagram (header + AEAD tag + UDP/IP) past the safe
+        // wire budget toward path-MTU fragmentation. The TUN device MTU is
+        // clamped to match, so this only fires for FD-backed or misconfigured
+        // devices — but it must be enforced here rather than trusted.
+        if packet.len() > MAX_PAYLOAD {
+            tracing::debug!(
+                len = packet.len(),
+                max = MAX_PAYLOAD,
+                "tun packet exceeds wire-safe payload; dropping"
+            );
+            let mut c = self.counters.lock().await;
+            c.tx_dropped_mtu = c.tx_dropped_mtu.saturating_add(1);
+            return false;
+        }
         // Congestion gate. The window check is the real drop condition: if we
         // are at the limit, the device is offering more than the path can
         // carry, and dropping (rather than queueing) is what keeps latency
@@ -707,6 +722,21 @@ impl Tunnel {
         };
         let frame = codec::encode_raw(&hdr, &ciphertext);
         let wire = self.wrap_frame(&frame);
+        // Post-transform guard: a custom obfuscation/transport stack (e.g. an
+        // oversized padding bucket) can inflate the datagram past the path
+        // MTU even when the TUN payload itself was within budget. Drop rather
+        // than fragment the outer datagram on the wire.
+        if wire.len() + OUTER_OVERHEAD > PATH_MTU {
+            tracing::debug!(
+                seq,
+                wire_len = wire.len(),
+                path_mtu = PATH_MTU,
+                "obfuscated datagram exceeds path MTU; dropping"
+            );
+            let mut c = self.counters.lock().await;
+            c.tx_dropped_mtu = c.tx_dropped_mtu.saturating_add(1);
+            return false;
+        }
         if let Err(e) = self.sock.send_to(&wire, self.peer).await {
             tracing::warn!(error = ?e, seq, peer = %self.peer, "udp send failed; dropping tun packet");
             return false;
@@ -810,6 +840,16 @@ impl Tunnel {
                     };
                     let frame = codec::encode_raw(&hdr, &ct);
                     let wire = self.wrap_frame(&frame);
+                    if wire.len() + OUTER_OVERHEAD > PATH_MTU {
+                        tracing::debug!(
+                            seq,
+                            wire_len = wire.len(),
+                            "obfuscated parity datagram exceeds path MTU; skipping"
+                        );
+                        let mut c = self.counters.lock().await;
+                        c.tx_dropped_mtu = c.tx_dropped_mtu.saturating_add(1);
+                        continue;
+                    }
                     if let Err(e) = self.sock.send_to(&wire, self.peer).await {
                         tracing::debug!(
                             error = ?e, seq, peer = %self.peer,
@@ -1913,6 +1953,36 @@ mod tests {
         );
         assert_eq!(c.tx_dropped_congestion, 1, "drop is observable in stats");
         assert_eq!(t.cc.in_flight, t.cc.cwnd, "dropped packet reserves no slot");
+    }
+
+    #[tokio::test]
+    async fn oversize_tun_packet_is_dropped_before_send() {
+        // A TUN packet larger than MAX_PAYLOAD would push the outer UDP
+        // datagram toward path-MTU fragmentation; it must be dropped and
+        // counted instead of shipped.
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let mut t = build_tunnel(sent.clone()).await;
+        let tx_before = t.counters.lock().await.tx_packets;
+        let sent_ok = t.handle_tun_packet(vec![0xAA; MAX_PAYLOAD + 1]).await;
+        assert!(!sent_ok, "oversize packet must not be sent");
+        let c = t.counters.lock().await;
+        assert_eq!(c.tx_packets, tx_before, "drop is not counted as sent");
+        assert_eq!(c.tx_dropped_mtu, 1, "drop is observable in stats");
+    }
+
+    #[tokio::test]
+    async fn max_payload_tun_packet_is_sent() {
+        // Boundary: exactly MAX_PAYLOAD must still go out (no off-by-one).
+        // The default FEC group is k=1, so sending one data packet also
+        // flushes one group and emits its parities — count the data send via
+        // the return value, not the aggregate tx_packets counter.
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let mut t = build_tunnel(sent.clone()).await;
+        let sent_ok = t.handle_tun_packet(vec![0xAA; MAX_PAYLOAD]).await;
+        assert!(sent_ok, "MAX_PAYLOAD-sized packet must be sent");
+        let c = t.counters.lock().await;
+        assert!(c.tx_packets >= 1, "data packet counted as sent");
+        assert_eq!(c.tx_dropped_mtu, 0, "no MTU drop on the boundary");
     }
 
     #[tokio::test]
