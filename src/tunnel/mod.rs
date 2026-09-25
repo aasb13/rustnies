@@ -256,8 +256,14 @@ impl Tunnel {
         recv_dir: Direction,
         counters: Arc<Mutex<Counters>>,
     ) -> io::Result<Self> {
-        let mut fec = AdaptiveFec::default_for_vpn();
-        let params = fec.observe(0.0);
+        let fec = AdaptiveFec::default_for_vpn();
+        // Do NOT call observe(0.0) here: that would snap current_m down to the
+        // floor immediately and throw away the configured starting redundancy
+        // (initial_m = 2 by default), forcing every packet out with the
+        // minimum parity from the very first byte. Start at the controller's
+        // initial_m so the first packets carry burst protection, and let the
+        // EMA earn its way down to min_m once real (zero) loss samples arrive.
+        let params = fec.params();
         let rs = ReedSolomon::new(params.k as usize, params.m as usize)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         Ok(Self {
@@ -327,7 +333,9 @@ impl Tunnel {
     /// are invalid (e.g. `k + m > 255`).
     pub fn configure_fec(&mut self, k: u8, min_m: u8, max_m: u8, initial_m: u8) {
         self.fec = AdaptiveFec::with_params(k, min_m, max_m, initial_m, 0.25);
-        self.fec_params = self.fec.observe(0.0);
+        // Start at the configured initial_m (burst protection on the first
+        // packets) rather than immediately relaxing to the floor.
+        self.fec_params = self.fec.params();
         match ReedSolomon::new(self.fec_params.k as usize, self.fec_params.m as usize) {
             Ok(r) => self.rs = r,
             Err(e) => {
@@ -2243,9 +2251,9 @@ mod tests {
         let mut t2 = build_tunnel(sent.clone()).await;
         t2.fec_params = FecParams { k: 2, m: 1 };
         t2.rs = ReedSolomon::new(2, 1).unwrap();
-        // With the default floor now at min_m=2, a single moderate loss sample
-        // only reaches the floor; feed a fully-undelivered (1.0-ratio) group so
-        // the controller is forced above the floor, proving unrecoverable loss
+        // With the default floor at min_m=1, a single moderate loss sample only
+        // reaches the floor; feed a fully-undelivered (1.0-ratio) group so the
+        // controller is forced above the floor, proving unrecoverable loss
         // still ramps redundancy.
         let m_before2 = t2.fec.params().m;
         let mut g = RxGroup::new(2, 1);

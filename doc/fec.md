@@ -83,7 +83,7 @@ succeeds.
 ### Limits
 
 `k + m <= 255` (GF(256) symbol alphabet). The adaptive controller's defaults
-(`k = 1`, `min_m = 2`, `max_m = 4`) stay well within this.
+(`k = 1`, `min_m = 1`, `max_m = 4`) stay well within this.
 
 ## Adaptive controller
 
@@ -94,11 +94,16 @@ FEC parameters. Future smarter controllers can replace it.
 
 - `k`: source symbols per group (constant by default; held so group formation
   delay stays predictable).
-- `min_m`, `max_m`: parity bounds.
+- `min_m`, `max_m`: parity bounds. `min_m` is the *floor the controller can
+  reach on a clean link* (default 1), not a permanent minimum: it is reached
+  only after the EMA smoothed loss falls below the lowest `down` band.
 - `up`: loss-ratio thresholds (fractions in `[0,1]`). When the smoothed loss
   exceeds `up[i]`, use at least `i+1` parities.
 - `down`: decrease thresholds; `down[i] = up[i] * 0.6` (hysteresis).
-- `current_m`: current parity count.
+- `current_m`: current parity count. **Starts at `initial_m` (default 2)**, not
+  at the floor, so the first packets carry burst protection before enough loss
+  samples exist. It relaxes toward `min_m` on a clean link and ramps toward
+  `max_m` once observed loss crosses a response band.
 - `smoothed_loss`: EMA-smoothed loss ratio.
 - `ema_alpha`: EMA smoothing factor (default `0.25`).
 
@@ -106,9 +111,9 @@ FEC parameters. Future smarter controllers can replace it.
 
 ```
 k          = 1
-min_m      = 2
+min_m      = 1
 max_m      = 4
-current_m  = 2
+current_m  = 2        (initial_m: starting redundancy, not the floor)
 ema_alpha  = 0.25
 up         = [0.05, 0.12, 0.22, 0.35]
 down       = up[i] * 0.6
@@ -119,13 +124,24 @@ group, so there are **no partial groups** and **no group-formation
 latency**. This matters for sparse traffic (ICMP pings at 1 pkt/s) and
 bursty traffic alike — every packet gets `m` parity copies immediately.
 
-The `min_m = 2` floor (rather than 1) is deliberate: with `k = 1` and
-`m = 1`, the data packet and its single parity twin are emitted
-back-to-back, so a 2-datagram burst loss kills both and is unrecoverable.
-`min_m = 2` adds a second parity twin, so the surviving third symbol
-rebuilds the packet — the regime lossy VPS/home links actually live in.
-Residual loss drops from `p²` to `p³`. On clean links `min_m` can be
-tuned down to 1 to reclaim the 100% overhead back to 50%.
+`min_m` defaults to **1, not 2**. With `k = 1` and `m = 1` a clean link
+pays only 100% overhead (each packet + one parity twin; residual loss `p²`),
+and the controller relaxes to this floor once the smoothed loss stays below
+`down[0]` = 0.03. The trade-off: a 2-datagram *burst* loss (data + its
+single parity twin, emitted back-to-back) is unrecoverable at `m = 1`. That
+is acceptable because the controller detects the resulting unrecoverable
+group and ramps `m` back to 2 (residual loss `p³`) within a handful of
+packets — bursty links are re-protected almost immediately, while genuinely
+clean links (the common case for a steady VPN uplink) stop paying the
+permanent 200% tax. The old `min_m = 2` floor forced 3x bandwidth on *every*
+link regardless of measured loss, which saturated thin uplinks and caused the
+bufferbloat that made interactive browsing unusable.
+
+`current_m` starts at **2** (`initial_m`) so the tunnel's very first packets
+still get burst protection before any loss samples exist; the EMA then earns
+its way down to `min_m` on a calm link. Note `min_m` must stay >= 1: with
+`m = 0` no RX FEC group is ever recorded, so a lost packet produces no
+recovery/eviction signal and the controller could never learn to ramp back up.
 
 With `max_m = 4`, the code tolerates up to ~80% underlying packet loss
 (any 1 of 5 symbols survives) at a bounded 400% overhead. A larger ceiling
@@ -156,6 +172,10 @@ Hysteresis (the `down` band being 60% of the `up` band) prevents the parity
 count from oscillating when the loss hovers near a threshold.
 
 `params()` returns the current `FecParams { k, m }` without mutating state.
+The tunnel initialises the controller at `initial_m` (2) and only relaxes
+toward `min_m` (1) as zero-loss samples arrive — it does **not** call
+`observe(0.0)` at startup, which would snap `current_m` straight to the floor
+and discard the burst protection on the first packets.
 
 ## Group lifecycle
 

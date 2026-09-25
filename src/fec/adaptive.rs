@@ -13,6 +13,9 @@
 //!   sends it with **zero** parity. With `k = 1`, every packet gets `m`
 //!   parity copies immediately, regardless of traffic rate.
 //! - `m` is clamped to `[min_m, max_m]` and `k + m <= 255` (GF(256) limit).
+//!   `min_m` is a floor that can be reached, not a permanent minimum: on a
+//!   clean link the EMA drives `m` down to `min_m` (which defaults to 1, i.e.
+//!   100% overhead), and ramps back up the moment sustained loss is observed.
 //!
 //! This is intentionally a simple, transparent policy. It is the *only* place
 //! that decides FEC parameters, so future smarter controllers can replace it.
@@ -60,27 +63,36 @@ impl AdaptiveFec {
     /// A sensible default tuned for reliability on unstable links.
     ///
     /// `k = 1` so every packet is its own FEC group (no partial groups,
-    /// no latency waiting for group fill). `min_m = 2` guarantees **two**
-    /// parity twins at all times on a clean link, so a 2-datagram burst
-    /// (data + its immediately-following parity twin both dropped) is still
-    /// recoverable from the third twin — with `min_m = 1` only an isolated
-    /// single-datagram loss is recoverable, which is the regime lossy VPS/home
-    /// links actually live in. `max_m = 4` caps overhead at 400% (any 1 of 5
-    /// copies surviving ~80% underlying loss): enough to ride out the kind of
-    /// burst loss the tunnel is designed for, without the self-inflicted flood
-    /// that a much larger ceiling caused on lossy links (the old `max_m = 20`
-    /// could amplify a modest real loss into 2000% overhead, which saturated the
-    /// link and produced *more* loss). The loss input is true wire-loss fed
-    /// from FEC recovery and unrecoverable-group eviction, so these thresholds
-    /// see real loss rather than an artifact of a stuck ack window. `ema_alpha
-    /// = 0.25` reacts within a handful of packets so a sudden loss spike ramps
-    /// redundancy quickly.
+    /// no latency waiting for group fill). `min_m = 1` lets a clean link
+    /// relax to a single parity twin (100% overhead instead of 200%): with
+    /// `k = 1` and `m = 1`, an isolated single-datagram loss is recoverable
+    /// (residual loss `p^2`, so 0.5% wire loss becomes ~0.0025% after FEC),
+    /// while a 2-datagram burst is not — the controller ramps back to `m = 2`
+    /// within a handful of packets when it sees real loss, so bursty links
+    /// still get the `p^3` protection. `current_m` starts at 2 so the first
+    /// packets go out with burst protection before any loss samples exist;
+    /// the EMA then earns its way down to 1 on consistently clean links
+    /// (smoothed loss below the lowest `down` band). `max_m = 4` caps overhead
+    /// at 400% (any 1 of 5 copies surviving ~80% underlying loss): enough to
+    /// ride out the kind of burst loss the tunnel is designed for, without
+    /// the self-inflicted flood that a much larger ceiling caused on lossy
+    /// links (the old `max_m = 20` could amplify a modest real loss into 2000%
+    /// overhead, which saturated the link and produced *more* loss). The loss
+    /// input is true wire-loss fed from FEC recovery and unrecoverable-group
+    /// eviction, so these thresholds see real loss rather than an artifact of
+    /// a stuck ack window. `ema_alpha = 0.25` reacts within a handful of
+    /// packets so a sudden loss spike ramps redundancy quickly.
+    ///
+    /// `min_m` must stay >= 1 (not 0): with `m = 0` no RX FEC group is ever
+    /// recorded, so a lost packet leaves no recovery/eviction signal and the
+    /// controller could never learn to ramp back up. `m = 1` is the lowest
+    /// floor that preserves the loss-feedback loop.
     pub fn default_for_vpn() -> Self {
         let up = vec![0.05, 0.12, 0.22, 0.35];
         let down = up.iter().map(|u| u * 0.6).collect();
         Self {
             k: 1,
-            min_m: 2,
+            min_m: 1,
             max_m: 4,
             up,
             down,
@@ -208,6 +220,31 @@ mod tests {
         let mut f = AdaptiveFec::default_for_vpn();
         f.observe(0.0);
         assert_eq!(f.params().m, f.min_m);
+    }
+
+    #[test]
+    fn starts_at_initial_m_not_floor() {
+        // The whole point of the fix: the tunnel must start at `initial_m` (2)
+        // so the first packets carry burst protection, and only relax to the
+        // floor (min_m = 1) after sustained zero-loss samples. A controller
+        // that snapped straight to the floor on startup would defeat the burst
+        // protection and re-introduce the permanent 200% overhead tax.
+        let f = AdaptiveFec::default_for_vpn();
+        assert_eq!(f.current_m, 2, "default starts at initial_m = 2");
+        // params() at construction (what the tunnel uses) must reflect that.
+        assert_eq!(
+            f.params().m,
+            2,
+            "initial params must be initial_m, not floor"
+        );
+        assert_eq!(f.min_m, 1, "floor is 1 (clean link relaxes to single twin)");
+
+        // After enough zero-loss samples, it should relax down to the floor.
+        let mut g = AdaptiveFec::default_for_vpn();
+        for _ in 0..80 {
+            g.observe(0.0);
+        }
+        assert_eq!(g.params().m, 1, "sustained clean link relaxes to min_m = 1");
     }
 
     #[test]

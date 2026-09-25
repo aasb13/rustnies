@@ -507,9 +507,9 @@ fn warn_unknown_keys(value: &toml::Value, path: &str, schema: &SectionSchema) {
 /// ```toml
 /// [fec]
 /// k = 1          # source symbols per group (1 = every packet is its own group)
-/// min_m = 2      # minimum parity symbols (survives a 2-datagram burst)
+/// min_m = 1      # minimum parity symbols (clean links relax to a single twin)
 /// max_m = 4      # maximum parity symbols (higher = more loss tolerance)
-/// initial_m = 2  # starting parity count before adaptation
+/// initial_m = 2  # starting parity count before adaptation (burst protection)
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FecConfig {
@@ -518,15 +518,20 @@ pub struct FecConfig {
     /// sparse traffic.
     #[serde(default = "default_fec_k")]
     pub k: u8,
-    /// Minimum parity symbols per group. Defaults to 2 so that a packet
-    /// (data + `m` parity twins) can survive a 2-datagram burst loss: with
-    /// `min_m = 1` only an *isolated* single-datagram loss is recoverable, and
-    /// because the data and its single parity are emitted back-to-back, any
-    /// 2-burst loss is unrecoverable — which is the regime lossy VPS/home links
-    /// actually live in. `min_m = 2` adds one extra twin so the surviving twin
-    /// rebuilds the packet; residual loss becomes `p^3` instead of `p^2`.
-    /// Tunable downward (e.g. `min_m = 1`) on clean links to reclaim the 100%
-    /// overhead back to 50%.
+    /// Minimum parity symbols per group. Defaults to 1 so a clean link can
+    /// relax to a single parity twin (100% overhead instead of 200%). With
+    /// `k = 1` and `m = 1`, an isolated single-datagram loss is recoverable
+    /// (residual loss `p^2`); a 2-datagram burst is not, but the adaptive
+    /// controller ramps `m` back to 2 within a handful of packets once it
+    /// observes real loss, restoring the `p^3` burst protection. This is the
+    /// floor, not the starting value: the tunnel starts at `initial_m` (2) so
+    /// the first packets still carry burst protection before any loss samples
+    /// exist, then the smoothed loss earns its way down to `min_m` on a
+    /// consistently clean link. `min_m` must stay >= 1 (not 0): with `m = 0`
+    /// no RX FEC group is ever recorded, so a lost packet leaves no
+    /// recovery/eviction signal and the controller could never learn to ramp
+    /// back up. Raise `min_m` (e.g. 2) on links you know are bursty; lower it
+    /// toward the floor only on links you have measured to be clean.
     #[serde(default = "default_fec_min_m")]
     pub min_m: u8,
     /// Maximum parity symbols per group. Higher values handle more loss at
@@ -546,10 +551,13 @@ fn default_fec_k() -> u8 {
     1
 }
 fn default_fec_min_m() -> u8 {
-    // 2: survives a 2-datagram burst (the data and its single parity twin are
-    // emitted back-to-back, so a burst that drops both is unrecoverable with
-    // only one twin). See the `min_m` field doc for the residual-loss math.
-    2
+    // 1: a clean link relaxes to a single parity twin (100% overhead, e.g. for
+    // ~0.5% wire loss the post-FEC residual is ~p^2). The controller starts at
+    // `initial_m` (2) for burst protection on the first packets, then earns its
+    // way down to `min_m` once the smoothed loss clears the lowest band. Keep
+    // this >= 1: with `m = 0` no RX FEC group is recorded, so loss is never
+    // signalled and the controller can never ramp back up.
+    1
 }
 fn default_fec_max_m() -> u8 {
     4
