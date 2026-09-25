@@ -160,9 +160,13 @@ anchor. `snapshot()` produces the `(ack_seq, ack_bitmap)` pair to advertise:
 `ack_seq` is the anchor (acked by definition), and bit `i` of `ack_bitmap`
 covers `ack_seq - 1 - i` (the 32 seqs immediately below the anchor).
 
-The sender tracks outstanding reliable packets and, on observing the peer's
-`ack_seq`/`ack_bitmap`, discards any whose seq the peer has now acknowledged
-(`Session::peer_acked`). Unacked packets past the retransmission timeout are
+The ACK fields are applied only after the packet's AEAD tag verifies. The
+sender retains exact-byte records for transmitted data/parity packets, retires
+acknowledged records, and finalizes a missing record as wire loss after it falls
+more than 32 sequence numbers below the forward-moving anchor or after
+`max(RTO, 500 ms)` if no ACK resolves it. A missing `Data` record contributes to source-loss and congestion
+windows; a missing `Fec` record releases its bytes but does not inflate source
+loss. Unacked reliable-control packets past the retransmission timeout are
 retransmitted.
 
 ## Replay protection

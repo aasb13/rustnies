@@ -223,11 +223,10 @@ a client IP:port. Operationally this changes what server-side tooling can assume
 1. A UDP datagram is received.
 2. `Transport::unwrap` reverses the wrap step, yielding the plaintext frame.
 3. `codec::decode` splits the frame into `PacketHeader` + ciphertext.
-4. The peer's advertised `ack_seq`/`ack_bitmap` are observed (this acks our
-   outstanding reliable control packets and releases congestion-controller
-   in-flight slots for newly acked data seqs).
-5. The ciphertext is AEAD-decrypted with the header as AAD. A failed tag
-   drops the packet silently.
+4. The ciphertext is AEAD-decrypted with the header as AAD. A failed tag
+   drops the packet silently without applying its ACK fields.
+5. The authenticated peer's advertised `ack_seq`/`ack_bitmap` are observed
+   and reconciled against exact-byte records for transmitted data/parity.
 6. Every authenticated packet is recorded in the ack tracker (its seq
    advances the ack anchor we advertise back). Reliable packet types
    (`Handshake1`, `Handshake2`, `Close`) additionally pass through the replay
@@ -237,14 +236,14 @@ a client IP:port. Operationally this changes what server-side tooling can assume
    - `Fec` -> recorded into the RX FEC group as a parity symbol.
    - `Ping` -> echoed back as `Pong` with the same 12-byte timestamp body.
    - `Pong` -> RTT sample fed to the congestion controller.
-   - `Ack` -> updates the congestion controller.
+   - `Ack` -> no additional action; its ACK fields were reconciled after
+     authentication.
    - `Close` -> tears down the tunnel.
 8. When an RX FEC group has at least `k` surviving symbols, Reed-Solomon
-   decodes the missing sources. Newly recovered source symbols (those that
-   were lost in transit, not already delivered) are written to the TUN, the
-   `fec_recovered` counter is bumped, a loss sample is fed to `AdaptiveFec`
-   (which may change `k`/`m` for future groups), and a loss signal is fed to
-   the congestion controller.
+   decodes the missing sources. Newly recovered sources are written to the TUN
+   and counted. The original sender derives loss feedback from the missing
+   source sequence in the peer's ACK window; receiver-side recovery never
+   changes the reverse direction's controllers.
 
 ### Background ticks
 

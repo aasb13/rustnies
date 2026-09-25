@@ -117,13 +117,18 @@ impl CongestionController {
         self.cwnd.saturating_sub(self.in_flight)
     }
 
-    /// Release `bytes` in-flight without growing the window. Used for seqs that
-    /// are resolved but *not* acknowledged (holes the peer's ack anchor jumped
-    /// over = lost on the wire). Growing cwnd on loss would be wrong; releasing
-    /// the bytes is still required so the budget does not leak to zero on a
-    /// lossy link and stall the sender forever.
+    /// Release `bytes` in-flight without growing the window. Used for sent
+    /// records finalized as lost by ACK-window or timeout resolution.
     pub fn release(&mut self, bytes: u64) {
         self.in_flight = self.in_flight.saturating_sub(bytes);
+    }
+
+    pub fn refund_send_bytes(&mut self, bytes: u64) {
+        self.release(bytes);
+        if let Some(next) = self.next_send_at {
+            let delay = Duration::from_secs_f64(bytes.max(1) as f64 / self.pacing_rate);
+            self.next_send_at = next.checked_sub(delay);
+        }
     }
 
     /// Release `n` in-flight *packets* (converted to bytes at the current MTU).
@@ -302,13 +307,8 @@ impl CongestionController {
     /// Signal loss(es). `lost` packets were lost; `total` were sent in the
     /// window they came from. Triggers multiplicative decrease.
     ///
-    /// This adjusts the window only and never touches `in_flight`: slot
-    /// lifetime is owned solely by the ack-resolution path (anchor advance
-    /// releases every resolved seq, acked or lost). The loss signals fed here
-    /// come from inbound FEC recovery/eviction on the *receiver* side, which
-    /// has no 1:1 relationship with this side's outstanding sends — releasing
-    /// outbound slots for inbound loss corrupts the budget accounting and can
-    /// double-release slots the ack path already freed.
+    /// This adjusts the window only; the tunnel's ACK reconciliation path owns
+    /// exact-byte slot retirement for both acknowledged and lost records.
     pub fn on_loss(&mut self, lost: u64, total: u64) {
         if total == 0 || lost == 0 {
             return;
@@ -429,6 +429,20 @@ mod tests {
             "two acks release two MTUs of in-flight"
         );
         assert!(c.cwnd > INITIAL_CWND_BYTES, "slow start grew window");
+    }
+
+    #[test]
+    fn refund_restores_window_and_pacing_credit() {
+        let mut c = CongestionController::new();
+        assert!(c.may_send(1000));
+        c.on_send_bytes(1000);
+        assert_eq!(c.in_flight, 1000);
+        assert!(c.pacing_delay(1000).is_some());
+
+        c.refund_send_bytes(1000);
+
+        assert_eq!(c.in_flight, 0);
+        assert!(c.pacing_delay(1000).is_none());
     }
 
     #[test]

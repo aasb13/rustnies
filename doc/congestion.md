@@ -103,16 +103,15 @@ Slot lifetime is owned by ack resolution, not by loss:
 
 - `on_send_bytes(len)` reserves `len` bytes in flight.
 - `on_ack_bytes(bytes)` releases acked bytes **and** grows the window.
-- `release(bytes)` releases bytes without growing the window — used for seqs
-  the peer's ack anchor jumped over (holes = lost on the wire). Growing cwnd
-  on loss would be wrong; releasing the bytes is still required so the budget
-  does not leak to zero on a lossy link and stall the sender forever.
+- `release(bytes)` releases bytes without growing the window for permanently
+  missing sequences. Growing cwnd on loss would be wrong; releasing the bytes
+  is still required so the budget does not leak to zero and stall the sender.
+- The tunnel retires each acknowledged or permanently lost `Data`/`Fec`
+  datagram using the exact bytes recorded at admission.
 
-`on_loss` adjusts the window **only** and never touches `in_flight`: its
-signals come from inbound FEC recovery/eviction on the *receiver* side, which
-has no 1:1 relationship with this side's outstanding sends — releasing
-outbound slots for inbound loss would corrupt the budget accounting and could
-double-release slots the ack path already freed.
+Loss is directional: the original sender reconciles its own transmitted
+records against authenticated peer ACK advertisements. Receiver-side FEC
+recovery never reduces the receiver's local outbound window.
 
 ## Acknowledgement
 
@@ -151,20 +150,22 @@ loss): the window collapses, throughput dies, and recovery from a low cwnd is
 slow. Scaling the reduction by how bad the loss actually was keeps a one-off
 loss cheap while still backing off hard on sustained loss.
 
-In the tunnel, loss signals come from two places:
+The tunnel records every successfully transmitted `Data` and `Fec` datagram
+with its exact charged bytes and kind. After AEAD authentication, peer
+`ack_seq`/`ack_bitmap` fields resolve those records:
 
-1. FEC recovery: when a group is decoded and some source symbols were
-   recovered (i.e. they were lost in transit), the recovered count is fed to
-   **both** `AdaptiveFec::observe_unrecoverable` (to increase redundancy) and
-   `CongestionController::on_loss` (to back off). FEC hides the loss from the
-   user — the packet was delivered — but it does not erase the loss from the
-   wire. Feeding recovery as loss is what breaks the runaway loop that
-   previously pinned loss at 100%: without it, the sender kept flooding a lossy
-   link, produced more loss, ramped parity to its 2000% ceiling, flooded the
-   link further, and never recovered.
-2. Unrecoverable loss: groups that expire without being decoded are fed to
-   `on_loss` by the eviction logic as well, so the window backs off when loss
-   exceeds the current FEC capacity.
+- acknowledged records release and grow the window;
+- records still inside the 33-entry selective window remain unresolved;
+- a missing record is finalized as lost after it falls more than 32 sequence
+  numbers below the peer's forward-moving anchor, or after `max(RTO, 500 ms)`
+  if no ACK resolves it.
+
+Outcomes are accumulated in 64-packet windows. This prevents a default `k=1`
+recovery from becoming an instantaneous `on_loss(1, 1)` event. The wire-loss
+window includes both source and parity packets. A separate 64-source window
+feeds adaptive FEC, so redundant parity does not inflate the source-loss
+population. A missing source sequence is the sender-side congestion signal
+even when FEC reconstructed the source successfully at the receiver.
 
 ## RTT estimation
 

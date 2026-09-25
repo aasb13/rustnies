@@ -83,7 +83,7 @@ succeeds.
 ### Limits
 
 `k + m <= 255` (GF(256) symbol alphabet). The adaptive controller's defaults
-(`k = 1`, `min_m = 1`, `max_m = 4`) stay well within this.
+(`k = 1`, `min_m = 0`, `max_m = 4`) stay well within this.
 
 ## Adaptive controller
 
@@ -94,9 +94,8 @@ FEC parameters. Future smarter controllers can replace it.
 
 - `k`: source symbols per group (constant by default; held so group formation
   delay stays predictable).
-- `min_m`, `max_m`: parity bounds. `min_m` is the *floor the controller can
-  reach on a clean link* (default 1), not a permanent minimum: it is reached
-  only after the EMA smoothed loss falls below the lowest `down` band.
+- `min_m`, `max_m`: parity bounds. The default `min_m = 0` lets a clean link
+  disable parity after sender-side ACK feedback establishes that it is unneeded.
 - `up`: loss-ratio thresholds (fractions in `[0,1]`). When the smoothed loss
   exceeds `up[i]`, use at least `i+1` parities.
 - `down`: decrease thresholds; `down[i] = up[i] * 0.6` (hysteresis).
@@ -111,7 +110,7 @@ FEC parameters. Future smarter controllers can replace it.
 
 ```
 k          = 1
-min_m      = 1
+min_m      = 0
 max_m      = 4
 current_m  = 2        (initial_m: starting redundancy, not the floor)
 ema_alpha  = 0.25
@@ -124,33 +123,21 @@ group, so there are **no partial groups** and **no group-formation
 latency**. This matters for sparse traffic (ICMP pings at 1 pkt/s) and
 bursty traffic alike — every packet gets `m` parity copies immediately.
 
-`min_m` defaults to **1, not 2**. With `k = 1` and `m = 1` a clean link
-pays only 100% overhead (each packet + one parity twin; residual loss `p²`),
-and the controller relaxes to this floor once the smoothed loss stays below
-`down[0]` = 0.03. The trade-off: a 2-datagram *burst* loss (data + its
-single parity twin, emitted back-to-back) is unrecoverable at `m = 1`. That
-is acceptable because the controller detects the resulting unrecoverable
-group and ramps `m` back to 2 (residual loss `p³`) within a handful of
-packets — bursty links are re-protected almost immediately, while genuinely
-clean links (the common case for a steady VPN uplink) stop paying the
-permanent 200% tax. The old `min_m = 2` floor forced 3x bandwidth on *every*
-link regardless of measured loss, which saturated thin uplinks and caused the
-bufferbloat that made interactive browsing unusable.
-
-`current_m` starts at **2** (`initial_m`) so the tunnel's very first packets
-still get burst protection before any loss samples exist; the EMA then earns
-its way down to `min_m` on a calm link. Note `min_m` must stay >= 1: with
-`m = 0` no RX FEC group is ever recorded, so a lost packet produces no
-recovery/eviction signal and the controller could never learn to ramp back up.
+`min_m` defaults to **0**. A clean link therefore pays no parity overhead
+once sender-side ACK outcomes show sustained zero source loss. The controller
+starts at `initial_m = 2` for burst protection, then uses 64-source ACK outcome
+windows to raise `m` when source loss crosses a response band. This feedback
+lives on the original sender, so it still works when the receiver sees no FEC
+group at all.
 
 With `max_m = 4`, the code tolerates up to ~80% underlying packet loss
 (any 1 of 5 symbols survives) at a bounded 400% overhead. A larger ceiling
 (the previous `max_m = 20`) could amplify a modest real loss into 2000%
-overhead, which saturated the link and produced *more* loss. Because the
-loss input is now true wire-loss fed from FEC recovery and unrecoverable
-group eviction, these thresholds see real loss rather than an artifact of
-a stuck ack window. The EMA (`alpha = 0.25`) reacts quickly so a sudden
-loss spike ramps redundancy within a handful of packets.
+overhead, which saturated the link and produced *more* loss. The loss input is
+a real 64-source population derived from the sender's selective ACK ledger, so
+these thresholds see actual source loss rather than a degenerate per-group
+`1/1` event. The EMA (`alpha = 0.25`) reacts over completed 64-source windows
+as sustained loss crosses a response band.
 
 These defaults are overridable via the `[fec]` TOML section (see
 `doc/daemon.md` or the config template).
@@ -173,7 +160,7 @@ count from oscillating when the loss hovers near a threshold.
 
 `params()` returns the current `FecParams { k, m }` without mutating state.
 The tunnel initialises the controller at `initial_m` (2) and only relaxes
-toward `min_m` (1) as zero-loss samples arrive — it does **not** call
+toward `min_m` (0) as zero-loss samples arrive — it does **not** call
 `observe(0.0)` at startup, which would snap `current_m` straight to the floor
 and discard the burst protection on the first packets.
 
@@ -228,31 +215,17 @@ bulk transfers.
   out-of-order or duplicated UDP delivery.
 - When a group has at least `k` surviving symbols and has not already been
   decoded, `recover_group()` runs Reed-Solomon decode. Newly recovered source
-  symbols (those not already delivered directly) are written to the TUN,
-  `fec_recovered` is bumped, and the recovered-symbol count is fed to both
-  `AdaptiveFec::observe_unrecoverable` (to increase redundancy) and the
-  congestion controller's `on_loss` (to back off). FEC recovery hides the
-  loss from the user — the packet *was* delivered — but it does not erase
-  the loss from the wire. Feeding it to the congestion controller is what
-  breaks the runaway loop that previously pinned loss at 100%: without it,
-  the sender kept flooding a lossy link, produced more loss, ramped parity
-  to its 2000% ceiling, flooded the link further, and never recovered. The
-  controller now shrinks the window on real loss, stops flooding, and the
-  measured loss rate falls, which lets the FEC controller scale redundancy
-  back down.
+  symbols are written to the TUN and counted in `fec_recovered`. The receiver
+  does not change either local controller here: its congestion window and FEC
+  parameters govern the opposite outbound direction. The original sender
+  learns that the source sequence was absent from the peer's selective ACK
+  window and updates its own congestion and FEC controllers from that feedback.
 - A successfully decoded group is **not** removed immediately. It is marked
   `decoded` with every source slot flagged delivered, and retained until
   `RX_GROUP_TTL = 5 s` so it keeps acting as the dedup set for any originals
   that arrive after being reconstructed from parity. No further recovery is
   attempted on a decoded group.
-- RX groups are evicted after `RX_GROUP_TTL = 5 s` to bound memory. When a
-  group is evicted **without** having been decoded (too many erasures for
-  the current parity count), the undelivered source count is fed to
-  `AdaptiveFec::observe_unrecoverable`. This is the only signal that fires
-  when loss exceeds the current FEC capacity — without it, the controller
-  would never learn that `m` is too low and would never increase
-  redundancy. The undelivered source count is also fed to the congestion
-  controller's `on_loss` so the window backs off. This closed-loop
-  feedback is what lets the tunnel survive bursty packet loss: the FEC
-  controller ramps `m` until unrecoverable evictions stop, and the
-  congestion controller stops flooding the link in the meantime.
+- RX groups are evicted after `RX_GROUP_TTL = 5 s` to bound memory. Sender-side
+  ACK accounting, rather than receiver eviction, supplies both recovered and
+  completely silent source-group loss to the controller in the sending
+  direction.

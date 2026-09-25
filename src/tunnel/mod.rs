@@ -38,7 +38,7 @@ use crate::transport::Transport;
 const RX_GROUP_TTL: Duration = Duration::from_secs(5);
 /// How often to send an RTT probe.
 const PING_INTERVAL: Duration = Duration::from_millis(500);
-/// How often to flush a partial TX FEC group / re-evaluate FEC params.
+/// How often to flush a partial TX FEC group / evict expired RX groups.
 const FEC_TICK: Duration = Duration::from_millis(100);
 /// How often to check for retransmit of unacked control packets.
 const RTO_TICK: Duration = Duration::from_millis(50);
@@ -53,13 +53,15 @@ const ACK_EVERY: u32 = 4;
 /// Max outstanding (unacked) reliable control packets.
 const MAX_OUTSTANDING_CONTROL: usize = 64;
 /// Largest RTT we will believe from a data-driven sample. Anything above this
-/// is a stale send-time record (or a seq reused after wrap), not a real path
+/// is a stale sent-packet record (or a seq reused after wrap), not a real path
 /// measurement, and would corrupt SRTT and the pacing rate.
 const MAX_RTT_SAMPLE: Duration = Duration::from_secs(10);
-/// Safety cap on the send-time map when the peer has not advertised any ack
-/// window yet. The steady-state bound comes from `prune_send_times` (the ack
-/// window); this only covers the pre-first-ack interval.
-const MAX_SEND_TIMES: usize = 4096;
+const MIN_SENT_PACKET_LIFETIME: Duration = Duration::from_millis(500);
+/// Number of completed outcomes in one aggregate loss sample. Counting both
+/// successes and losses prevents a single recovered `k=1` source from being
+/// interpreted as 100% path loss.
+const LOSS_SAMPLE_PACKETS: u64 = 64;
+const LOSS_SAMPLE_SOURCES: u64 = 64;
 /// How often to send an authenticated keepalive during idle periods.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 /// If no traffic (keepalive or real) is seen from a peer within this timeout,
@@ -104,6 +106,40 @@ struct Outstanding {
     ptype: PacketType,
     payload: Vec<u8>, // the encrypted frame to retransmit
     last_sent: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SentPacketKind {
+    Data,
+    Parity,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SentPacket {
+    bytes: u64,
+    sent_at: Instant,
+    kind: SentPacketKind,
+}
+
+#[derive(Debug, Default)]
+struct LossWindow {
+    total: u64,
+    lost: u64,
+}
+
+impl LossWindow {
+    fn record(&mut self, lost: bool, sample_size: u64) -> Option<(u64, u64)> {
+        self.total = self.total.saturating_add(1);
+        if lost {
+            self.lost = self.lost.saturating_add(1);
+        }
+        if self.total >= sample_size {
+            let sample = (self.lost, self.total);
+            *self = Self::default();
+            return Some(sample);
+        }
+        None
+    }
 }
 
 /// A receive-side FEC group under assembly.
@@ -193,13 +229,13 @@ pub struct Tunnel {
     /// feedback even with no reverse traffic to piggyback on.
     rx_since_ack: u32,
 
-    /// When each of our outgoing wire seqs was handed to the socket. Populated
-    /// by `send_data_like` / `send_packet` and drained as the peer's ack
-    /// advertisement retires those seqs. This is what lets a data packet's
-    /// round trip feed the congestion controller's RTT estimator: the ping
-    /// probe alone only samples the path every `PING_INTERVAL`, which is far
-    /// too coarse to grow a window against live traffic.
-    send_times: HashMap<u32, Instant>,
+    /// Successfully transmitted data/parity packets awaiting selective-ack
+    /// resolution. Exact byte charges prevent mixed packet sizes from being
+    /// retired as a flat MTU, while the kind separates source loss from
+    /// redundant-parity loss.
+    sent_packets: HashMap<u32, SentPacket>,
+    wire_loss_window: LossWindow,
+    source_loss_window: LossWindow,
 
     /// The packet the send gate refused on the last TUN read because the
     /// *pacer* (not the window) was holding it back. Carried into the next loop
@@ -294,7 +330,9 @@ impl Tunnel {
             last_peer_ack: 0,
             last_peer_bitmap: 0,
             rx_since_ack: 0,
-            send_times: HashMap::new(),
+            sent_packets: HashMap::new(),
+            wire_loss_window: LossWindow::default(),
+            source_loss_window: LossWindow::default(),
             pending_out: None,
             pending_deadline: None,
             closing: false,
@@ -341,7 +379,7 @@ impl Tunnel {
             Err(e) => {
                 tracing::warn!(?e, "invalid FEC config; falling back to defaults");
                 self.fec = AdaptiveFec::default_for_vpn();
-                self.fec_params = self.fec.observe(0.0);
+                self.fec_params = self.fec.params();
                 self.rs = ReedSolomon::new(self.fec_params.k as usize, self.fec_params.m as usize)
                     .expect("default FEC params must be valid");
             }
@@ -725,6 +763,7 @@ impl Tunnel {
             Ok(ct) => ct,
             Err(e) => {
                 tracing::error!(error = ?e, seq, "data encrypt failed; dropping packet");
+                self.cc.refund_send_bytes(len as u64);
                 return false;
             }
         };
@@ -743,15 +782,22 @@ impl Tunnel {
             );
             let mut c = self.counters.lock().await;
             c.tx_dropped_mtu = c.tx_dropped_mtu.saturating_add(1);
+            self.cc.refund_send_bytes(len as u64);
             return false;
         }
         if let Err(e) = self.sock.send_to(&wire, self.peer).await {
             tracing::warn!(error = ?e, seq, peer = %self.peer, "udp send failed; dropping tun packet");
+            self.cc.refund_send_bytes(len as u64);
             return false;
         }
-        // Remember when this seq went out so the ack advertisement that
-        // retires it can produce a real RTT sample for the controller.
-        self.send_times.insert(seq, Instant::now());
+        self.sent_packets.insert(
+            seq,
+            SentPacket {
+                bytes: len as u64,
+                sent_at: Instant::now(),
+                kind: SentPacketKind::Data,
+            },
+        );
 
         {
             let mut c = self.counters.lock().await;
@@ -843,6 +889,7 @@ impl Tunnel {
                         Ok(ct) => ct,
                         Err(e) => {
                             tracing::error!(error = ?e, seq, "parity encrypt failed; skipping");
+                            self.cc.refund_send_bytes(plen as u64);
                             continue;
                         }
                     };
@@ -856,6 +903,7 @@ impl Tunnel {
                         );
                         let mut c = self.counters.lock().await;
                         c.tx_dropped_mtu = c.tx_dropped_mtu.saturating_add(1);
+                        self.cc.refund_send_bytes(plen as u64);
                         continue;
                     }
                     if let Err(e) = self.sock.send_to(&wire, self.peer).await {
@@ -863,9 +911,17 @@ impl Tunnel {
                             error = ?e, seq, peer = %self.peer,
                             "fec parity udp send failed; parity datagram lost"
                         );
+                        self.cc.refund_send_bytes(plen as u64);
                         continue;
                     }
-                    self.send_times.insert(seq, Instant::now());
+                    self.sent_packets.insert(
+                        seq,
+                        SentPacket {
+                            bytes: plen as u64,
+                            sent_at: Instant::now(),
+                            kind: SentPacketKind::Parity,
+                        },
+                    );
                     let mut c = self.counters.lock().await;
                     c.tx_packets += 1;
                     c.tx_bytes += parity.len() as u64;
@@ -994,209 +1050,72 @@ impl Tunnel {
         }
     }
 
-    /// The RTT of the **oldest** seq newly acknowledged by the latest peer ack
-    /// advertisement, or `None` if no newly-acked seq still has a send-time
-    /// record (already pruned, or it was a control seq we never tracked).
-    ///
-    /// Oldest-by-seq is the right sample here: those packets were dispatched
-    /// earliest, so their measured delay is least contaminated by queuing that
-    /// this sender itself created. Using the newest seq instead makes a
-    /// perfectly healthy path look slow whenever a burst is in flight (the
-    /// last packet of a burst measures the whole burst's drain time), which
-    /// would drive SRTT up, shrink the pacing rate, and throttle the flow.
-    fn newly_acked_rtt(&self, prev_ack: u32, prev_bitmap: u32) -> Option<Duration> {
+    fn reconcile_peer_acks(&mut self) -> bool {
         let anchor = self.session.peer_ack;
-        let bitmap = self.session.peer_bitmap;
-        if anchor == 0 {
-            return None;
-        }
-        let now_acked = |s: u32| -> bool {
-            if s == 0 {
-                return false;
-            }
-            if s == anchor {
-                return true;
-            }
-            let back = anchor.wrapping_sub(s);
-            if back >= 1 && back <= 32 {
-                (bitmap >> (back - 1)) & 1 == 1
-            } else {
-                false
-            }
-        };
-        let was_acked = |s: u32| -> bool {
-            if prev_ack == 0 {
-                return false;
-            }
-            if s == prev_ack {
-                return true;
-            }
-            let back = prev_ack.wrapping_sub(s);
-            if back >= 1 && back <= 32 {
-                (prev_bitmap >> (back - 1)) & 1 == 1
-            } else {
-                false
-            }
-        };
-        // Walk from the anchor downwards; the last (lowest) newly-acked seq we
-        // find is the oldest, so remember it as we go.
-        let mut oldest: Option<u32> = None;
-        let mut s = anchor;
-        for _ in 0..=32u32 {
-            if now_acked(s) && !was_acked(s) {
-                oldest = Some(s);
-            }
-            if s == 0 {
-                break;
-            }
-            s = s.wrapping_sub(1);
-        }
-        // The anchor itself is the newest; only trust it if nothing older
-        // showed up, and only when it actually became acked just now.
-        let seq = match oldest {
-            Some(s) => s,
-            None => return None,
-        };
-        let sent = self.send_times.get(&seq)?;
-        // Guard against a stale record (clock skew, or a seq reused after the
-        // 2^32 wrap). A negative or absurd RTT would corrupt SRTT and pin the
-        // pacing rate; fall back to "no sample" instead.
-        let rtt = Instant::now().saturating_duration_since(*sent);
-        if rtt.is_zero() || rtt > MAX_RTT_SAMPLE {
-            return None;
-        }
-        Some(rtt)
-    }
+        let mut acked_bytes = 0u64;
+        let mut lost_bytes = 0u64;
+        let mut oldest_ack: Option<Instant> = None;
+        let mut resolved = Vec::new();
 
-    /// Drop send-time records the peer's ack window already covers, keeping the
-    /// map bounded (at most the ack window plus whatever is genuinely in
-    /// flight).
-    fn prune_send_times(&mut self) {
-        let anchor = self.session.peer_ack;
-        let bitmap = self.session.peer_bitmap;
-        if anchor == 0 {
-            // Nothing advertised yet: keep a safety cap so a peer that never
-            // acks cannot leak memory.
-            if self.send_times.len() > MAX_SEND_TIMES {
-                let mut keys: Vec<u32> = self.send_times.keys().copied().collect();
-                keys.sort_unstable();
-                for k in keys.iter().take(self.send_times.len() - MAX_SEND_TIMES / 2) {
-                    self.send_times.remove(k);
-                }
+        let now = Instant::now();
+        let expiry = self.cc.rto().max(MIN_SENT_PACKET_LIFETIME);
+        for (seq, sent) in &self.sent_packets {
+            if self.session.peer_acked(*seq) {
+                acked_bytes = acked_bytes.saturating_add(sent.bytes);
+                oldest_ack = Some(oldest_ack.map_or(sent.sent_at, |at| at.min(sent.sent_at)));
+                resolved.push((*seq, true, *sent));
+                continue;
             }
-            return;
+            let back = anchor.wrapping_sub(*seq);
+            let outside_window = back > 32 && back <= (u32::MAX >> 1);
+            if outside_window || now.saturating_duration_since(sent.sent_at) >= expiry {
+                lost_bytes = lost_bytes.saturating_add(sent.bytes);
+                resolved.push((*seq, false, *sent));
+            }
         }
-        self.send_times.retain(|&seq, _| {
-            if seq == anchor {
-                return false; // acked by definition
-            }
-            let back = anchor.wrapping_sub(seq);
-            if back == 0 || back > 32 {
-                // Outside the ack window: it is either ancient (resolved) or a
-                // future seq we have not sent. Drop ancient ones.
-                return back <= (u32::MAX >> 1);
-            }
-            // Inside the window: keep only while still marked missing.
-            (bitmap >> (back - 1)) & 1 == 0
-        });
-    }
 
-    /// Count our outgoing seqs newly acknowledged by the latest peer ack
-    /// advertisement, relative to the previous one we already accounted for.
-    ///
-    /// The ack format is a sliding window (see `AckTracker`): `anchor` is the
-    /// peer's highest received seq (acked by definition) and bit `i` of
-    /// `bitmap` covers `anchor - 1 - i`. We release one in-flight slot per
-    /// seq the peer now knows about that it did not on the previous
-    /// advertisement. Capped at the current `in_flight` so a runaway or
-    /// stale advertisement can never drive the counter negative (the
-    /// saturation in `on_ack` would otherwise paper over it, but bounding
-    /// here keeps the window growth sane).
-    fn newly_acked_count(&self, prev_ack: u32, prev_bitmap: u32) -> u64 {
-        let anchor = self.session.peer_ack;
-        let bitmap = self.session.peer_bitmap;
-        if anchor == 0 {
-            return 0;
-        }
-        // The set of seqs acked by an advertisement is infinite in principle
-        // (everything below the anchor up to the 32-bit window). Counting the
-        // *new* ones is equivalent to walking the 33 candidate seqs
-        // (anchor plus the 32 below it) and counting those that are acked now
-        // but were not acked by (prev_ack, prev_bitmap).
-        let now_acked = |s: u32| -> bool {
-            if s == 0 {
-                return false;
-            }
-            if s == anchor {
-                return true;
-            }
-            let back = anchor.wrapping_sub(s);
-            if back >= 1 && back <= 32 {
-                (bitmap >> (back - 1)) & 1 == 1
-            } else {
-                false
-            }
-        };
-        let was_acked = |s: u32| -> bool {
-            if prev_ack == 0 {
-                return false;
-            }
-            if s == prev_ack {
-                return true;
-            }
-            let back = prev_ack.wrapping_sub(s);
-            if back >= 1 && back <= 32 {
-                (prev_bitmap >> (back - 1)) & 1 == 1
-            } else {
-                false
-            }
-        };
-        let mut count = 0u64;
-        let mut s = anchor;
-        for _ in 0..=32u32 {
-            if now_acked(s) && !was_acked(s) {
-                count += 1;
-            }
-            // Walk downwards below the anchor. Stop at the wrap boundary.
-            if s == 0 {
-                break;
-            }
-            s = s.wrapping_sub(1);
-        }
-        count.min(self.cc.in_flight)
-    }
+        resolved.sort_by_key(|(_, _, sent)| sent.sent_at);
 
-    /// How many of our seqs left flight since the previous advertisement,
-    /// whether acked or lost. This is the anchor advance (forward only),
-    /// capped at `in_flight` so a stale/jumped advertisement can never drive
-    /// the counter negative. Backward/wrap moves resolve nothing — fall back
-    /// to zero and let the acked-count path handle any bitmap fills.
-    fn newly_resolved_count(&self, prev_ack: u32) -> u64 {
-        let anchor = self.session.peer_ack;
-        if anchor == 0 {
-            return 0;
+        for (seq, _, _) in &resolved {
+            self.sent_packets.remove(seq);
         }
-        if prev_ack == 0 {
-            // First advertisement: our seqs run 1..=anchor with no gaps on
-            // the send side, so every seq up to the anchor has left flight
-            // (acked or lost). Cap at in_flight for sanity.
-            return (anchor as u64).min(self.cc.in_flight);
+
+        let mut rtt_sampled = false;
+        if acked_bytes > 0 {
+            let rtt = oldest_ack.and_then(|sent| {
+                let rtt = Instant::now().saturating_duration_since(sent);
+                (!rtt.is_zero() && rtt <= MAX_RTT_SAMPLE).then_some(rtt)
+            });
+            rtt_sampled = rtt.is_some();
+            match rtt {
+                Some(rtt) => self.cc.on_ack_with_rtt(acked_bytes, rtt),
+                None => self.cc.on_ack_bytes(acked_bytes),
+            }
         }
-        let advance = anchor.wrapping_sub(prev_ack);
-        if advance == 0 {
-            // Same anchor: resolution (if any) is bitmap fills below it, which
-            // `newly_acked_count` already counts. Nothing extra to release.
-            return 0;
+        if lost_bytes > 0 {
+            self.cc.release(lost_bytes);
         }
-        if advance > (u32::MAX >> 1) {
-            // Backward move or wrap: not a forward advance, resolve nothing.
-            return 0;
+
+        for (_, acked, sent) in resolved {
+            let lost = !acked;
+            if let Some((lost, total)) = self.wire_loss_window.record(lost, LOSS_SAMPLE_PACKETS) {
+                self.cc.on_loss(lost, total);
+            }
+
+            if sent.kind == SentPacketKind::Data
+                && let Some((lost, total)) =
+                    self.source_loss_window.record(lost, LOSS_SAMPLE_SOURCES)
+            {
+                self.fec.observe_unrecoverable(lost, total);
+                self.apply_fec_params();
+            }
         }
-        (advance as u64).min(self.cc.in_flight)
+        rtt_sampled
     }
 
     /// Retransmit unacked control packets whose RTO has elapsed.
     async fn check_retransmits(&mut self) {
+        self.reconcile_peer_acks();
         let rto = self.cc.rto();
         let mut to_resend: Vec<usize> = Vec::new();
         for (i, o) in self.outstanding.iter().enumerate() {
@@ -1250,63 +1169,6 @@ impl Tunnel {
             "recv packet"
         );
 
-        // Observe the peer's ack advertisement (covers every packet type).
-        self.session.observe_acks(hdr.ack_seq, hdr.ack_bitmap);
-        // Piggyback acks report what the peer has received from us, for *all*
-        // packet types. Two kinds of resolution happen here:
-        // - acked seqs: release an in-flight slot AND grow the window.
-        // - lost seqs (holes the anchor jumped over): release the slot but
-        //   do NOT grow the window. Without this, best-effort data lost on
-        //   the wire never releases its slot (data is never retransmitted),
-        //   `in_flight` leaks upward, `send_budget` pins at zero and the
-        //   sender stalls after any sustained loss.
-        // Trigger on anchor OR bitmap change: holes filled below a stable
-        // anchor still ack new seqs.
-        if self.session.peer_ack != self.last_peer_ack
-            || self.session.peer_bitmap != self.last_peer_bitmap
-        {
-            let acked = self.newly_acked_count(self.last_peer_ack, self.last_peer_bitmap);
-            let resolved = self.newly_resolved_count(self.last_peer_ack);
-            // `resolved` covers every seq that left flight since the last
-            // advertisement (acked + lost); `acked` is the subset to grow on.
-            let lost = resolved.saturating_sub(acked);
-            // Turn the *newly acked* wire seqs into a data-driven RTT sample.
-            // This is what keeps the window responsive: the ping probe samples
-            // the path only twice a second, so a bulk flow had no feedback that
-            // could raise its window between pings. Sampling the oldest newly
-            // acked seq (rather than the newest) avoids crediting the sender
-            // with a queuing delay it created itself, which would collapse the
-            // window on a path that is actually fast.
-            let rtt = self.newly_acked_rtt(self.last_peer_ack, self.last_peer_bitmap);
-            // Retire the send-time records for every seq the peer now covers,
-            // so the map cannot grow without bound.
-            self.prune_send_times();
-
-            // Byte counts: the window is in bytes, so retire and grow by the
-            // number of bytes the acked seqs represented. Without this, a
-            // packet-count-to-byte conversion would price every acked seq at
-            // the full MTU, overgrowing the window for small packets (acks and
-            // ping replies) — the exact failure mode the byte accounting is
-            // meant to fix.
-            let acked_bytes = (acked as u64).saturating_mul(self.cc.mtu as u64);
-            let lost_bytes = (lost as u64).saturating_mul(self.cc.mtu as u64);
-            if lost_bytes > 0 {
-                self.cc.release(lost_bytes);
-            }
-            if acked_bytes > 0 {
-                match rtt {
-                    Some(sample) => {
-                        self.cc.on_ack_with_rtt(acked_bytes, sample);
-                        let mut c = self.counters.lock().await;
-                        c.rtt_samples = c.rtt_samples.saturating_add(1);
-                    }
-                    None => self.cc.on_ack_bytes(acked_bytes),
-                }
-            }
-            self.last_peer_ack = self.session.peer_ack;
-            self.last_peer_bitmap = self.session.peer_bitmap;
-        }
-
         // Decrypt.
         let nonce = aead::make_nonce(self.session.id, hdr.seq, self.recv_dir);
         let hdr_bytes = hdr.to_bytes();
@@ -1317,6 +1179,16 @@ impl Tunnel {
                 return Ok(());
             }
         };
+
+        if hdr.ack_seq != self.last_peer_ack || hdr.ack_bitmap != self.last_peer_bitmap {
+            self.session.observe_acks(hdr.ack_seq, hdr.ack_bitmap);
+            if self.reconcile_peer_acks() {
+                let mut c = self.counters.lock().await;
+                c.rtt_samples = c.rtt_samples.saturating_add(1);
+            }
+            self.last_peer_ack = hdr.ack_seq;
+            self.last_peer_bitmap = hdr.ack_bitmap;
+        }
 
         // Roaming: a successfully decrypted datagram from a new source address
         // means the peer has moved. Update `self.peer` so subsequent sends go to
@@ -1444,18 +1316,6 @@ impl Tunnel {
             let mut c = self.counters.lock().await;
             c.rx_bytes += 0; // already counted
         }
-        // This source symbol arrived directly on the wire (not reconstructed
-        // from parity): feed a zero-loss sample to the adaptive FEC EMA. The
-        // controller is otherwise only fed loss (via `observe_unrecoverable`
-        // in `recover_group`/`evict_expired_rx_groups`), so without a
-        // dilution signal for every packet that *didn't* need recovery, the
-        // smoothed loss ratchets toward 100% after any packet loss at all and
-        // never comes back down, even on an otherwise healthy link. Sampling
-        // it once per directly-delivered group keeps the EMA tracking true
-        // wire loss (lost groups / total groups) instead of "fraction lost
-        // among groups that had any loss".
-        self.fec.observe(0.0);
-        self.apply_fec_params();
         // Record into RX FEC group if FEC is enabled.
         if hdr.fec_m > 0 {
             self.record_rx_symbol(
@@ -1594,22 +1454,6 @@ impl Tunnel {
                 let mut c = self.counters.lock().await;
                 c.fec_recovered += newly_recovered;
             }
-            // Loss sample: the fraction of source symbols that were lost in
-            // transit and reconstructed from parity. Feed it to the adaptive
-            // FEC controller so it can increase redundancy, and to the
-            // congestion controller so it can back off. These packets *were*
-            // lost on the wire: FEC hides that from the user, but it does not
-            // erase the congestion signal. Feeding both controllers is what
-            // breaks the runaway loop that previously pinned loss at 100%:
-            // the congestion controller now shrinks the window on real loss,
-            // so we stop flooding the link and the measured loss rate falls,
-            // which in turn lets the FEC controller scale redundancy back
-            // down from its 2000% ceiling.
-            let lost = newly_recovered as u64;
-            let total = k as u64;
-            self.fec.observe_unrecoverable(lost, total);
-            self.cc.on_loss(lost, total);
-            self.apply_fec_params();
         }
     }
 
@@ -1670,37 +1514,7 @@ impl Tunnel {
 
     fn evict_expired_rx_groups(&mut self) {
         let now = Instant::now();
-        // Before evicting, detect groups that expired without being decoded
-        // (too many erasures for the current parity count). These represent
-        // unrecoverable data loss: feed it to both the adaptive FEC controller
-        // (to increase redundancy) and the congestion controller (to shrink
-        // the window). This is the only signal that fires when loss exceeds
-        // the current FEC capacity — without it, the controllers would never
-        // learn that m is too low or that the link is congested.
-        let mut total_lost = 0u64;
-        let mut total_sources = 0u64;
-        self.rx_groups.retain(|_, g| {
-            if g.deadline <= now {
-                if !g.decoded && g.k > 0 {
-                    let undelivered = g.delivered.iter().filter(|&&d| !d).count() as u64;
-                    total_lost += undelivered;
-                    total_sources += g.k as u64;
-                }
-                false
-            } else {
-                true
-            }
-        });
-        if total_lost > 0 {
-            tracing::debug!(
-                lost = total_lost,
-                total = total_sources,
-                "unrecoverable FEC groups evicted; increasing redundancy"
-            );
-            self.fec.observe_unrecoverable(total_lost, total_sources);
-            self.cc.on_loss(total_lost, total_sources);
-            self.apply_fec_params();
-        }
+        self.rx_groups.retain(|_, group| group.deadline > now);
     }
 
     async fn publish_stats(&mut self) {
@@ -1862,81 +1676,143 @@ mod tests {
         assert!(bitmap & 0b10 != 0, "seq 1 sits two below the anchor");
     }
 
+    fn record_sent(t: &mut Tunnel, seq: u32, bytes: u64, kind: SentPacketKind) {
+        t.cc.on_send_bytes(bytes as usize);
+        t.sent_packets.insert(
+            seq,
+            SentPacket {
+                bytes,
+                sent_at: Instant::now(),
+                kind,
+            },
+        );
+    }
+
     #[tokio::test]
-    async fn piggyback_ack_advertisement_releases_in_flight_slots() {
+    async fn piggyback_ack_releases_exact_recorded_bytes() {
         let sent = Arc::new(StdMutex::new(Vec::new()));
         let mut t = build_tunnel(sent.clone()).await;
-        for _ in 0..3 {
-            t.cc.on_send();
-        }
+        record_sent(&mut t, 1, 100, SentPacketKind::Data);
+        record_sent(&mut t, 2, 200, SentPacketKind::Parity);
+        record_sent(&mut t, 3, 300, SentPacketKind::Data);
         let cwnd_before = t.cc.cwnd;
-        // The peer advertises anchor 2 plus bit 0 (seq 1): two of our seqs
-        // are newly acknowledged.
+
         t.handle_udp_datagram(
             &peer_frame(PacketType::Keepalive, 1, 2, 0b01, b""),
             "127.0.0.1:1".parse().unwrap(),
         )
         .await
         .unwrap();
-        assert_eq!(
-            t.cc.in_flight, t.cc.mtu as u64,
-            "two newly acked seqs release two slots' worth of bytes"
-        );
-        assert!(t.cc.cwnd > cwnd_before, "acks grow the window");
-        // Receiving the same advertisement again releases nothing more:
-        // already-accounted acks must not be double-counted.
-        t.handle_udp_datagram(
-            &peer_frame(PacketType::Keepalive, 2, 2, 0b01, b""),
-            "127.0.0.1:1".parse().unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            t.cc.in_flight, t.cc.mtu as u64,
-            "duplicate advertisement is not recounted"
-        );
-        // An advertisement advancing the anchor releases the delta.
-        t.handle_udp_datagram(
-            &peer_frame(PacketType::Keepalive, 3, 3, 0b11, b""),
-            "127.0.0.1:1".parse().unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(t.cc.in_flight, 0, "anchor advance releases the new seq");
+
+        assert_eq!(t.cc.in_flight, 300);
+        assert_eq!(t.cc.cwnd, cwnd_before + 300);
+        assert_eq!(t.sent_packets.len(), 1);
     }
 
     #[tokio::test]
-    async fn ack_anchor_jump_over_hole_releases_lost_slot_without_growth() {
-        // Best-effort data lost on the wire still occupies an in-flight slot.
-        // When the peer's anchor jumps over the hole, the slot must be
-        // released (or the sender stalls) but the window must only grow for
-        // the acked seq, not the lost one.
+    async fn ack_hole_is_loss_only_after_leaving_selective_window() {
         let sent = Arc::new(StdMutex::new(Vec::new()));
         let mut t = build_tunnel(sent.clone()).await;
-        for _ in 0..3 {
-            t.cc.on_send();
-        }
-        let cwnd_before = t.cc.cwnd;
-        // Anchor 3 with an empty bitmap: seq 3 acked, seqs 1-2 are holes the
-        // anchor jumped over (lost). All three leave flight; only one ack.
+        record_sent(&mut t, 1, 100, SentPacketKind::Data);
+        record_sent(&mut t, 2, 200, SentPacketKind::Parity);
+        record_sent(&mut t, 3, 300, SentPacketKind::Data);
+
         t.handle_udp_datagram(
-            &peer_frame(PacketType::Keepalive, 1, 3, 0b00, b""),
+            &peer_frame(PacketType::Keepalive, 1, 3, 0b01, b""),
             "127.0.0.1:1".parse().unwrap(),
         )
         .await
         .unwrap();
+        assert_eq!(t.cc.in_flight, 100);
+        assert!(t.sent_packets.contains_key(&1));
+
+        t.handle_udp_datagram(
+            &peer_frame(PacketType::Keepalive, 2, 40, 0, b""),
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(t.cc.in_flight, 0);
+        assert!(t.sent_packets.is_empty());
+        assert_eq!(t.wire_loss_window.lost, 1);
+        assert_eq!(t.source_loss_window.lost, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_unacked_record_times_out_without_ack_horizon_progress() {
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let mut t = build_tunnel(sent).await;
+        record_sent(&mut t, 1, 100, SentPacketKind::Data);
+        t.sent_packets.get_mut(&1).unwrap().sent_at = Instant::now() - Duration::from_secs(1);
+
+        t.reconcile_peer_acks();
+
+        assert_eq!(t.cc.in_flight, 0);
+        assert!(t.sent_packets.is_empty());
+        assert_eq!(t.wire_loss_window.lost, 1);
+        assert_eq!(t.source_loss_window.lost, 1);
+    }
+
+    #[tokio::test]
+    async fn sender_ack_loss_uses_aggregate_not_degenerate_ratio() {
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let mut t = build_tunnel(sent.clone()).await;
+        record_sent(&mut t, 1, 100, SentPacketKind::Data);
+        for seq in 35..=97 {
+            record_sent(&mut t, seq, 100, SentPacketKind::Data);
+        }
+        t.cc.cwnd = 1_000_000;
+        t.cc.ssthresh = 0;
+        let cwnd_before = t.cc.cwnd;
+
+        t.session.observe_acks(66, u32::MAX);
+        t.reconcile_peer_acks();
+        assert_eq!(t.sent_packets.len(), 31);
+        assert!(t.sent_packets.contains_key(&67));
+        assert_eq!(t.cc.last_loss, 0.0);
+
+        t.session.observe_acks(97, 0x7FFF_FFFF);
+        t.reconcile_peer_acks();
+        assert!(t.sent_packets.is_empty());
+        assert_eq!(t.cc.last_loss, 1.0 / 64.0);
+        assert_eq!(t.fec.smoothed_loss, 1.0 / 256.0);
+        assert_eq!(t.fec_params.m, 0);
+        assert!(t.cc.cwnd < cwnd_before);
+    }
+
+    #[test]
+    fn loss_window_uses_real_population() {
+        let mut window = LossWindow::default();
+        for _ in 0..63 {
+            assert!(window.record(false, LOSS_SAMPLE_PACKETS).is_none());
+        }
         assert_eq!(
-            t.cc.in_flight, 0,
-            "jumped-over holes must release their slots"
+            window.record(true, LOSS_SAMPLE_PACKETS),
+            Some((1, LOSS_SAMPLE_PACKETS))
         );
-        // Slow start grows by the acked bytes, not per resolved slot: only
-        // seq 3 was acked, so the window grows by one MTU's worth of bytes
-        // (the byte-based window replaced the old packet-count one).
-        assert_eq!(
-            t.cc.cwnd,
-            cwnd_before + t.cc.mtu as u64,
-            "window grows only for the acked seq"
-        );
+        assert_eq!(window.total, 0);
+        assert_eq!(window.lost, 0);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_ack_cannot_change_congestion_state() {
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let mut t = build_tunnel(sent.clone()).await;
+        record_sent(&mut t, 1, 100, SentPacketKind::Data);
+        let in_flight = t.cc.in_flight;
+        let cwnd = t.cc.cwnd;
+        let mut frame = peer_frame(PacketType::Keepalive, 1, 40, 0, b"");
+        let last = frame.len() - 1;
+        frame[last] ^= 1;
+
+        t.handle_udp_datagram(&frame, "127.0.0.1:1".parse().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(t.session.peer_ack, 0);
+        assert_eq!(t.cc.in_flight, in_flight);
+        assert_eq!(t.cc.cwnd, cwnd);
+        assert_eq!(t.sent_packets.len(), 1);
     }
 
     #[tokio::test]
@@ -2196,13 +2072,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fec_recovery_signals_loss_to_congestion() {
-        // FEC recovery hides the loss from the user (the packet is delivered),
-        // but the packet *was* lost on the wire. The congestion controller must
-        // learn about that loss so it can back off; otherwise it keeps flooding
-        // a lossy link, which produces more loss, which produces more parity,
-        // which floods the link further. Feeding recovery as loss is what
-        // breaks that runaway loop.
+    async fn fec_recovery_does_not_reduce_local_congestion_window() {
+        // Receiver-side recovery belongs to the inbound direction and must not
+        // reduce this endpoint's outbound congestion window.
         let sent = Arc::new(StdMutex::new(Vec::new()));
         let mut t = build_tunnel(sent.clone()).await;
         let (k, m) = (4u8, 2u8);
@@ -2222,52 +2094,23 @@ mod tests {
         t.handle_parity(parity_hdr(7, k + 1, k, m), parities[1].clone())
             .await;
         let cwnd_after = t.cc.cwnd;
-        assert!(
-            cwnd_after < cwnd_before,
-            "congestion window must shrink on FEC recovery (1 of {k} lost): before={cwnd_before}, after={cwnd_after}"
-        );
+        assert_eq!(cwnd_after, cwnd_before);
     }
 
     #[tokio::test]
-    async fn unrecoverable_group_increases_redundancy() {
-        // When a group expires without being decoded (too many erasures),
-        // the adaptive controller should increase m.
+    async fn unrecoverable_rx_group_does_not_change_local_direction() {
         let sent = Arc::new(StdMutex::new(Vec::new()));
-        let mut t = build_tunnel(sent.clone()).await;
-        t.fec_params = FecParams { k: 1, m: 1 };
-        t.rs = ReedSolomon::new(1, 1).unwrap();
-        // Simulate a group that received only 1 parity but lost the data
-        // and has 0 surviving symbols to decode — it will expire undelivered.
-        // We create a group entry with only a parity (index 1), no data.
-        t.handle_parity(parity_hdr(42, 1, 1, 1), vec![0xFF; 16])
-            .await;
-        // The group has 1 symbol (the parity) but k=1, so present >= k
-        // triggers recovery. With only the parity surviving, RS decode
-        // will succeed (the parity IS one of the n symbols, and with k=1
-        // and m=1, any 1 symbol recovers the source). So we need a case
-        // where present < k. With k=2, m=1: deliver only 1 of 3 symbols.
-        // Let's redo with k=2, planting a group that received *no* data slots
-        // (both sources undelivered) so eviction reports a 1.0 loss ratio.
-        let mut t2 = build_tunnel(sent.clone()).await;
-        t2.fec_params = FecParams { k: 2, m: 1 };
-        t2.rs = ReedSolomon::new(2, 1).unwrap();
-        // With the default floor at min_m=1, a single moderate loss sample only
-        // reaches the floor; feed a fully-undelivered (1.0-ratio) group so the
-        // controller is forced above the floor, proving unrecoverable loss
-        // still ramps redundancy.
-        let m_before2 = t2.fec.params().m;
-        let mut g = RxGroup::new(2, 1);
-        g.deadline = Instant::now() - Duration::from_secs(1);
-        // Both source slots undelivered: a total loss of the group.
-        t2.rx_groups.insert(99, g);
-        t2.evict_expired_rx_groups();
-        let m_after2 = t2.fec.params().m;
-        assert!(
-            m_after2 > m_before2,
-            "unrecoverable eviction should increase m: before={}, after={}",
-            m_before2,
-            m_after2
-        );
+        let mut tunnel = build_tunnel(sent).await;
+        let m_before = tunnel.fec.params().m;
+        let cwnd_before = tunnel.cc.cwnd;
+        let mut group = RxGroup::new(2, 1);
+        group.deadline = Instant::now() - Duration::from_secs(1);
+        tunnel.rx_groups.insert(99, group);
+
+        tunnel.evict_expired_rx_groups();
+
+        assert_eq!(tunnel.fec.params().m, m_before);
+        assert_eq!(tunnel.cc.cwnd, cwnd_before);
     }
 
     /// Session timeout: if no traffic arrives from the peer within the

@@ -507,7 +507,7 @@ fn warn_unknown_keys(value: &toml::Value, path: &str, schema: &SectionSchema) {
 /// ```toml
 /// [fec]
 /// k = 1          # source symbols per group (1 = every packet is its own group)
-/// min_m = 1      # minimum parity symbols (clean links relax to a single twin)
+/// min_m = 0      # minimum parity symbols (clean links can disable FEC)
 /// max_m = 4      # maximum parity symbols (higher = more loss tolerance)
 /// initial_m = 2  # starting parity count before adaptation (burst protection)
 /// ```
@@ -518,20 +518,10 @@ pub struct FecConfig {
     /// sparse traffic.
     #[serde(default = "default_fec_k")]
     pub k: u8,
-    /// Minimum parity symbols per group. Defaults to 1 so a clean link can
-    /// relax to a single parity twin (100% overhead instead of 200%). With
-    /// `k = 1` and `m = 1`, an isolated single-datagram loss is recoverable
-    /// (residual loss `p^2`); a 2-datagram burst is not, but the adaptive
-    /// controller ramps `m` back to 2 within a handful of packets once it
-    /// observes real loss, restoring the `p^3` burst protection. This is the
-    /// floor, not the starting value: the tunnel starts at `initial_m` (2) so
-    /// the first packets still carry burst protection before any loss samples
-    /// exist, then the smoothed loss earns its way down to `min_m` on a
-    /// consistently clean link. `min_m` must stay >= 1 (not 0): with `m = 0`
-    /// no RX FEC group is ever recorded, so a lost packet leaves no
-    /// recovery/eviction signal and the controller could never learn to ramp
-    /// back up. Raise `min_m` (e.g. 2) on links you know are bursty; lower it
-    /// toward the floor only on links you have measured to be clean.
+    /// Minimum parity symbols per group. Defaults to zero so a consistently
+    /// clean link pays no FEC overhead after the controller has measured enough
+    /// source outcomes. The tunnel starts at `initial_m` for burst protection,
+    /// then sender-side ACK loss feedback raises or lowers `m` for later groups.
     #[serde(default = "default_fec_min_m")]
     pub min_m: u8,
     /// Maximum parity symbols per group. Higher values handle more loss at
@@ -551,21 +541,12 @@ fn default_fec_k() -> u8 {
     1
 }
 fn default_fec_min_m() -> u8 {
-    // 1: a clean link relaxes to a single parity twin (100% overhead, e.g. for
-    // ~0.5% wire loss the post-FEC residual is ~p^2). The controller starts at
-    // `initial_m` (2) for burst protection on the first packets, then earns its
-    // way down to `min_m` once the smoothed loss clears the lowest band. Keep
-    // this >= 1: with `m = 0` no RX FEC group is recorded, so loss is never
-    // signalled and the controller can never ramp back up.
-    1
+    0
 }
 fn default_fec_max_m() -> u8 {
     4
 }
 fn default_fec_initial_m() -> u8 {
-    // Start at the floor (min_m). The adaptive controller lowers `m` toward
-    // `min_m` on a clean link and raises it toward `max_m` once observed loss
-    // crosses a response band.
     2
 }
 
