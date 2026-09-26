@@ -34,14 +34,24 @@ src/
     mod.rs            Re-exports.
     header.rs         24-byte compact PacketHeader, PacketType, HeaderFlags.
     codec.rs          Packet encode/decode (header || ciphertext framing).
-    session.rs        Session: sequencing, ReplayWindow, AckTracker.
+    session.rs        Session: sequencing, ReplayWindow, AckTracker,
+                      session_id_from_hash.
+    handshake.rs      Handshake trait (KEX seam), HandshakeError, build_handshake,
+                      SessionEstablished, InitiatorHello.
+    profile.rs        Protocol profiles: ClientOffer / Selection wire formats,
+                      the server-authoritative selection rule, LocalProfile
+                      (pre-handshake config) and ResolvedProfile (a session's
+                      runnable parts). See doc/profiles.md.
   crypto/
     mod.rs            Re-exports.
     keys.rs           Static X25519 KeyPair (generate / load_or_create at 0600).
-    noise.rs          Noise IK handshake state machine (Split -> app keys).
+    noise.rs          Noise IK handshake state machine (Split -> app keys,
+                      keyed by the negotiated cipher suite).
     aead.rs           ChaCha20-Poly1305 with deterministic per-packet nonces.
+    suite.rs          AeadCipher trait + registry (the swappable cipher seam).
   transport/
-    mod.rs            Swappable Transport trait + PlainTransport / TaggedTransport.
+    mod.rs            Swappable Transport trait + PlainTransport / TaggedTransport
+                      + name/id registry.
   obfuscation/
     mod.rs            ObfuscationLayer trait + ObfuscationStack (ordered, composable).
     padding.rs        SizePadding layer (bucket-based size hiding).

@@ -111,6 +111,150 @@ pub struct ObfuscationConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Protocol profile (shared by runtime and file configs)
+// ---------------------------------------------------------------------------
+//
+// These four sections select which implementation of each swappable protocol
+// part a session runs. See `doc/profiles.md` for the full model.
+//
+// Three are *negotiated* in the handshake (`[crypto]`, `[transport] data`,
+// `[fec] scheme`): the server picks, from its own ordered preference, the first
+// candidate the client also supports, and its answer travels in the Noise
+// message-2 payload.
+//
+// One is purely *local* (`[congestion]`): a congestion window is invisible to
+// the peer, so there is nothing to agree on and each side uses its own.
+//
+// Two settings are *config-pinned on both peers* because they are needed before
+// any negotiation channel exists: `[handshake] kex` and
+// `[transport] handshake`. A mismatch there is detected and reported at
+// handshake time, not negotiated away.
+
+/// The `[handshake]` section: key exchange and profile negotiation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HandshakeConfig {
+    /// Key-exchange algorithm. Must be named identically in the server's and
+    /// the client's config: the KEX is what carries the profile negotiation, so
+    /// it cannot itself be negotiated. `"noise-ik"` is the only phase-1 value.
+    ///
+    /// An unknown name is a **hard error** on both sides (not a warn-and-skip as
+    /// for an obfuscation layer): a fallback would leave the peers running
+    /// different algorithms and every handshake would time out with no useful
+    /// diagnostic.
+    #[serde(default = "default_kex")]
+    pub kex: String,
+    /// Whether the client appends its ordered capability offer to message 1, so
+    /// the server can pick something both sides support. `false` (the default)
+    /// means the server simply picks its own first preference and the client
+    /// validates the answer.
+    ///
+    /// Off by default because appending a payload to message 1 is a wire change
+    /// a peer that predates it cannot parse. Turning it on requires *both* peers
+    /// to be new; the message-2 answer is additive and needs no such opt-in.
+    #[serde(default)]
+    pub propose: bool,
+}
+
+fn default_kex() -> String {
+    crate::protocol::handshake::DEFAULT_HANDSHAKE.to_string()
+}
+
+impl Default for HandshakeConfig {
+    fn default() -> Self {
+        Self {
+            kex: default_kex(),
+            propose: false,
+        }
+    }
+}
+
+/// The `[crypto]` section: the per-packet AEAD suite.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CryptoConfig {
+    /// Ordered preference list of AEAD cipher names. The first entry is the
+    /// default; the rest are fallbacks. Empty (the default) means
+    /// `["chacha20poly1305"]`.
+    ///
+    /// **Negotiated.** The chosen suite is also folded into the Noise
+    /// transport-key HKDF, so peers that disagree derive different keys and the
+    /// mismatch surfaces as an authentication failure on the first data packet
+    /// rather than as a session that appears to connect and then misbehaves.
+    #[serde(default)]
+    pub aead: Vec<String>,
+}
+
+/// The `[transport]` section: the datagram envelope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransportConfig {
+    /// Envelope for the Noise handshake messages. A single name, not a list,
+    /// because it cannot be negotiated — it is what carries the negotiation.
+    /// Must match on both peers. `"plain"` (the default) is the identity.
+    ///
+    /// A keyed transport cannot be used here: its key material is derived from
+    /// the handshake hash, which does not exist until the handshake completes.
+    #[serde(default = "default_transport_name")]
+    pub handshake: String,
+    /// Ordered preference list of envelopes for steady-state frames. The first
+    /// entry is the default; the rest are fallbacks. Empty (the default) means
+    /// `["same-as-handshake"]`, which reuses the handshake envelope and needs no
+    /// negotiation at all.
+    ///
+    /// **Negotiated.** The first supported entry wins; see
+    /// [`crate::protocol::profile`].
+    #[serde(default = "default_data_transports")]
+    pub data: Vec<String>,
+    /// Two-byte framing tag for the `"tagged"` data envelope, as 4 hex digits.
+    ///
+    /// **Server-side only.** The tag travels inside the server's negotiation
+    /// answer, so a client never has to configure one. It does not affect the
+    /// handshake transport, which always uses the compiled-in default tag on
+    /// both peers. Empty (the default) uses that same default.
+    #[serde(default)]
+    pub tag_hex: Option<String>,
+}
+
+fn default_transport_name() -> String {
+    crate::transport::DEFAULT_TRANSPORT.to_string()
+}
+
+fn default_data_transports() -> Vec<String> {
+    vec![crate::transport::TRANSPORT_SAME_AS_HANDSHAKE.to_string()]
+}
+
+impl Default for TransportConfig {
+    fn default() -> Self {
+        Self {
+            handshake: default_transport_name(),
+            data: default_data_transports(),
+            tag_hex: None,
+        }
+    }
+}
+
+/// The `[congestion]` section: the sender's rate limiter.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CongestionConfig {
+    /// Congestion-control algorithm. A single name, not a list: the setting is
+    /// **purely local** (a congestion window is invisible to the peer, so there
+    /// is nothing to negotiate) and a preference list would have no meaning.
+    /// Empty (the default) means `"tcp-reno"`.
+    #[serde(default = "default_congestion_name")]
+    pub algorithm: String,
+}
+
+fn default_congestion_name() -> String {
+    crate::congestion::DEFAULT_CONGESTION.to_string()
+}
+
+impl Default for CongestionConfig {
+    fn default() -> Self {
+        Self {
+            algorithm: default_congestion_name(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Runtime configs (fully resolved, consumed by the daemon)
 // ---------------------------------------------------------------------------
 
@@ -158,6 +302,14 @@ pub struct ServerConfig {
     pub obfuscation: Option<ObfuscationConfig>,
     /// Resolved FEC (forward error correction) configuration.
     pub fec: FecConfig,
+    /// Resolved `[handshake]` configuration (KEX name + whether to propose).
+    pub handshake: HandshakeConfig,
+    /// Resolved `[crypto]` configuration (AEAD suite preference).
+    pub crypto: CryptoConfig,
+    /// Resolved `[transport]` configuration (envelope selection).
+    pub transport: TransportConfig,
+    /// Resolved `[congestion]` configuration (local rate limiter).
+    pub congestion: CongestionConfig,
     /// Maximum concurrent sessions accepted from a single static peer key. A
     /// misbehaving or malicious client can otherwise open sessions until the
     /// server exhausts memory/fds. When a new handshake from an already-saturated
@@ -188,6 +340,10 @@ impl Default for ServerConfig {
             log_file: None,
             obfuscation: None,
             fec: FecConfig::default(),
+            handshake: HandshakeConfig::default(),
+            crypto: CryptoConfig::default(),
+            transport: TransportConfig::default(),
+            congestion: CongestionConfig::default(),
             max_sessions_per_peer: 0,
         }
     }
@@ -276,6 +432,14 @@ pub struct ClientConfig {
     pub obfuscation: Option<ObfuscationConfig>,
     /// Resolved FEC (forward error correction) configuration.
     pub fec: FecConfig,
+    /// Resolved `[handshake]` configuration (KEX name + whether to propose).
+    pub handshake: HandshakeConfig,
+    /// Resolved `[crypto]` configuration (AEAD suite preference).
+    pub crypto: CryptoConfig,
+    /// Resolved `[transport]` configuration (envelope selection).
+    pub transport: TransportConfig,
+    /// Resolved `[congestion]` configuration (local rate limiter).
+    pub congestion: CongestionConfig,
 }
 
 impl Default for ClientConfig {
@@ -303,6 +467,10 @@ impl Default for ClientConfig {
             log_file: None,
             obfuscation: None,
             fec: FecConfig::default(),
+            handshake: HandshakeConfig::default(),
+            crypto: CryptoConfig::default(),
+            transport: TransportConfig::default(),
+            congestion: CongestionConfig::default(),
         }
     }
 }
@@ -400,7 +568,31 @@ const PEER_SCHEMA: SectionSchema = SectionSchema {
 };
 
 const FEC_SCHEMA: SectionSchema = SectionSchema {
-    scalars: &["k", "min_m", "max_m", "initial_m"],
+    scalars: &["scheme", "k", "min_m", "max_m", "initial_m"],
+    tables: &[],
+    array_tables: &[],
+};
+
+const HANDSHAKE_SCHEMA: SectionSchema = SectionSchema {
+    scalars: &["kex", "propose"],
+    tables: &[],
+    array_tables: &[],
+};
+
+const CRYPTO_SCHEMA: SectionSchema = SectionSchema {
+    scalars: &["aead"],
+    tables: &[],
+    array_tables: &[],
+};
+
+const TRANSPORT_SCHEMA: SectionSchema = SectionSchema {
+    scalars: &["handshake", "data", "tag_hex"],
+    tables: &[],
+    array_tables: &[],
+};
+
+const CONGESTION_SCHEMA: SectionSchema = SectionSchema {
+    scalars: &["algorithm"],
     tables: &[],
     array_tables: &[],
 };
@@ -419,6 +611,10 @@ const SERVER_SCHEMA: SectionSchema = SectionSchema {
         ("nat", &NAT_SCHEMA),
         ("obfuscation", &OBFUSCATION_SCHEMA),
         ("fec", &FEC_SCHEMA),
+        ("handshake", &HANDSHAKE_SCHEMA),
+        ("crypto", &CRYPTO_SCHEMA),
+        ("transport", &TRANSPORT_SCHEMA),
+        ("congestion", &CONGESTION_SCHEMA),
     ],
     array_tables: &[("peers", &PEER_SCHEMA)],
 };
@@ -443,6 +639,10 @@ const CLIENT_SCHEMA: SectionSchema = SectionSchema {
         ("nat", &CLIENT_NAT_SCHEMA),
         ("obfuscation", &OBFUSCATION_SCHEMA),
         ("fec", &FEC_SCHEMA),
+        ("handshake", &HANDSHAKE_SCHEMA),
+        ("crypto", &CRYPTO_SCHEMA),
+        ("transport", &TRANSPORT_SCHEMA),
+        ("congestion", &CONGESTION_SCHEMA),
     ],
     array_tables: &[],
 };
@@ -506,6 +706,7 @@ fn warn_unknown_keys(value: &toml::Value, path: &str, schema: &SectionSchema) {
 ///
 /// ```toml
 /// [fec]
+/// scheme = ["reed-solomon"]  # ordered preference; "none" disables parity entirely
 /// k = 1          # source symbols per group (1 = every packet is its own group)
 /// min_m = 0      # minimum parity symbols (clean links can disable FEC)
 /// max_m = 4      # maximum parity symbols (higher = more loss tolerance)
@@ -513,6 +714,15 @@ fn warn_unknown_keys(value: &toml::Value, path: &str, schema: &SectionSchema) {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FecConfig {
+    /// Ordered preference list of FEC erasure codes. The first entry is the
+    /// default; the rest are fallbacks so a mixed-version deployment connects
+    /// either way. Empty (the default) means `["reed-solomon"]`.
+    ///
+    /// This is *negotiated* in the handshake, because a mismatched code would
+    /// corrupt groups rather than fail cleanly. The server's order wins; see
+    /// `doc/profiles.md`.
+    #[serde(default)]
+    pub scheme: Vec<String>,
     /// Source symbols per FEC group. `k = 1` (the default) means every
     /// packet is its own group, eliminating partial-group vulnerability for
     /// sparse traffic.
@@ -553,6 +763,7 @@ fn default_fec_initial_m() -> u8 {
 impl Default for FecConfig {
     fn default() -> Self {
         Self {
+            scheme: default_fec_scheme(),
             k: default_fec_k(),
             min_m: default_fec_min_m(),
             max_m: default_fec_max_m(),
@@ -561,9 +772,14 @@ impl Default for FecConfig {
     }
 }
 
+fn default_fec_scheme() -> Vec<String> {
+    vec![crate::fec::DEFAULT_FEC_SCHEME.to_string()]
+}
+
 /// `[fec]` section for file configs (all `Option`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FecSection {
+    pub scheme: Option<Vec<String>>,
     pub k: Option<u8>,
     pub min_m: Option<u8>,
     pub max_m: Option<u8>,
@@ -628,6 +844,18 @@ pub struct ServerFileConfig {
     /// `[fec]` section. `None` (no section) leaves FEC at defaults.
     #[serde(default)]
     pub fec: Option<FecSection>,
+    /// `[handshake]` section. `None` leaves the KEX and negotiation at defaults.
+    #[serde(default)]
+    pub handshake: Option<HandshakeConfig>,
+    /// `[crypto]` section. `None` leaves the AEAD suite at its default.
+    #[serde(default)]
+    pub crypto: Option<CryptoConfig>,
+    /// `[transport]` section. `None` leaves the envelope at its default.
+    #[serde(default)]
+    pub transport: Option<TransportConfig>,
+    /// `[congestion]` section. `None` leaves the algorithm at its default.
+    #[serde(default)]
+    pub congestion: Option<CongestionConfig>,
     /// Max concurrent sessions from one static peer key. `None` (no field)
     /// leaves the runtime default. See `ServerConfig::max_sessions_per_peer`.
     #[serde(default)]
@@ -698,6 +926,18 @@ pub struct ClientFileConfig {
     /// `[fec]` section. `None` (no section) leaves FEC at defaults.
     #[serde(default)]
     pub fec: Option<FecSection>,
+    /// `[handshake]` section. `None` leaves the KEX and negotiation at defaults.
+    #[serde(default)]
+    pub handshake: Option<HandshakeConfig>,
+    /// `[crypto]` section. `None` leaves the AEAD suite at its default.
+    #[serde(default)]
+    pub crypto: Option<CryptoConfig>,
+    /// `[transport]` section. `None` leaves the envelope at its default.
+    #[serde(default)]
+    pub transport: Option<TransportConfig>,
+    /// `[congestion]` section. `None` leaves the algorithm at its default.
+    #[serde(default)]
+    pub congestion: Option<CongestionConfig>,
 }
 
 impl ClientFileConfig {
@@ -793,6 +1033,9 @@ pub fn merge_server_config(
         base.obfuscation = Some(v);
     }
     if let Some(v) = file.fec {
+        if let Some(x) = v.scheme {
+            base.fec.scheme = x;
+        }
         if let Some(x) = v.k {
             base.fec.k = x;
         }
@@ -805,6 +1048,18 @@ pub fn merge_server_config(
         if let Some(x) = v.initial_m {
             base.fec.initial_m = x;
         }
+    }
+    if let Some(v) = file.handshake {
+        base.handshake = v;
+    }
+    if let Some(v) = file.crypto {
+        base.crypto = v;
+    }
+    if let Some(v) = file.transport {
+        base.transport = v;
+    }
+    if let Some(v) = file.congestion {
+        base.congestion = v;
     }
     if let Some(v) = file.max_sessions_per_peer {
         base.max_sessions_per_peer = v;
@@ -915,6 +1170,12 @@ pub fn merge_client_config(
     if let Some(v) = file.tun.prefix {
         base.tun_prefix = v;
     }
+    if let Some(v) = file.tun.addr6 {
+        base.tun_addr6 = Some(v);
+    }
+    if let Some(v) = file.tun.prefix6 {
+        base.tun_prefix6 = Some(v);
+    }
     if let Some(v) = file.tun.mtu {
         base.tun_mtu = v;
     }
@@ -922,6 +1183,9 @@ pub fn merge_client_config(
         base.obfuscation = Some(v);
     }
     if let Some(v) = file.fec {
+        if let Some(x) = v.scheme {
+            base.fec.scheme = x;
+        }
         if let Some(x) = v.k {
             base.fec.k = x;
         }
@@ -934,6 +1198,18 @@ pub fn merge_client_config(
         if let Some(x) = v.initial_m {
             base.fec.initial_m = x;
         }
+    }
+    if let Some(v) = file.handshake {
+        base.handshake = v;
+    }
+    if let Some(v) = file.crypto {
+        base.crypto = v;
+    }
+    if let Some(v) = file.transport {
+        base.transport = v;
+    }
+    if let Some(v) = file.congestion {
+        base.congestion = v;
     }
 
     // CLI overrides.
@@ -1782,5 +2058,376 @@ log_file = "/var/log/rustnies/c.log"
 "#;
         assert!(ServerFileConfig::from_toml(server_toml).is_ok());
         assert!(ClientFileConfig::from_toml(client_toml).is_ok());
+    }
+
+    // ---- Protocol profile sections -------------------------------------
+    //
+    // The four sections that select which implementation of each swappable
+    // protocol part a session runs. See `doc/profiles.md`. These tests cover
+    // parsing, the merge into the runtime config, and the defaults, because a
+    // mistake in any of those silently changes what a deployment negotiates.
+
+    const FULL_PROFILE_TOML: &str = r#"
+[handshake]
+kex = "noise-ik"
+propose = true
+
+[crypto]
+aead = ["chacha20poly1305"]
+
+[transport]
+handshake = "plain"
+data = ["tagged", "same-as-handshake"]
+tag_hex = "abcd"
+
+[fec]
+scheme = ["reed-solomon"]
+k = 2
+min_m = 1
+max_m = 6
+initial_m = 3
+
+[congestion]
+algorithm = "none"
+"#;
+
+    #[test]
+    fn profile_sections_parse_on_the_server_side() {
+        let file = ServerFileConfig::from_toml(FULL_PROFILE_TOML).unwrap();
+        let h = file.handshake.unwrap();
+        assert_eq!(h.kex, "noise-ik");
+        assert!(h.propose);
+        assert_eq!(file.crypto.unwrap().aead, ["chacha20poly1305"]);
+        let t = file.transport.unwrap();
+        assert_eq!(t.handshake, "plain");
+        assert_eq!(t.data, ["tagged", "same-as-handshake"]);
+        assert_eq!(t.tag_hex.as_deref(), Some("abcd"));
+        let f = file.fec.unwrap();
+        assert_eq!(f.scheme.as_deref(), Some(&["reed-solomon".to_string()][..]));
+        assert_eq!(f.k, Some(2));
+        assert_eq!(file.congestion.unwrap().algorithm, "none");
+    }
+
+    #[test]
+    fn profile_sections_parse_on_the_client_side() {
+        // The client config has the same four sections; a key that only existed
+        // on the server would be silently ignored here.
+        let file = ClientFileConfig::from_toml(FULL_PROFILE_TOML).unwrap();
+        assert!(file.handshake.unwrap().propose);
+        assert_eq!(file.crypto.unwrap().aead, ["chacha20poly1305"]);
+        assert_eq!(file.transport.unwrap().data.len(), 2);
+        assert_eq!(file.fec.unwrap().k, Some(2));
+        assert_eq!(file.congestion.unwrap().algorithm, "none");
+    }
+
+    #[test]
+    fn profile_sections_merge_into_the_server_runtime_config() {
+        let file = ServerFileConfig::from_toml(FULL_PROFILE_TOML).unwrap();
+        let merged = merge_server_config(
+            ServerConfig::default(),
+            file,
+            &ServerCliOverrides::default(),
+        );
+        assert_eq!(merged.handshake.kex, "noise-ik");
+        assert!(merged.handshake.propose);
+        assert_eq!(merged.crypto.aead, ["chacha20poly1305"]);
+        assert_eq!(merged.transport.handshake, "plain");
+        assert_eq!(merged.transport.data, ["tagged", "same-as-handshake"]);
+        assert_eq!(merged.transport.tag_hex.as_deref(), Some("abcd"));
+        assert_eq!(merged.fec.scheme, ["reed-solomon"]);
+        assert_eq!(merged.fec.k, 2);
+        assert_eq!(merged.fec.max_m, 6);
+        assert_eq!(merged.congestion.algorithm, "none");
+    }
+
+    #[test]
+    fn profile_sections_merge_into_the_client_runtime_config() {
+        let file = ClientFileConfig::from_toml(FULL_PROFILE_TOML).unwrap();
+        let merged = merge_client_config(
+            ClientConfig::default(),
+            file,
+            &ClientCliOverrides::default(),
+        );
+        assert!(merged.handshake.propose);
+        assert_eq!(merged.crypto.aead, ["chacha20poly1305"]);
+        assert_eq!(merged.transport.data, ["tagged", "same-as-handshake"]);
+        assert_eq!(merged.fec.scheme, ["reed-solomon"]);
+        assert_eq!(merged.congestion.algorithm, "none");
+    }
+
+    #[test]
+    fn absent_profile_sections_leave_the_defaults() {
+        // An empty config file must resolve to the rustnies defaults, which is
+        // what keeps an unconfigured deployment on the pre-negotiation protocol.
+        let file = ServerFileConfig::from_toml("").unwrap();
+        let merged = merge_server_config(
+            ServerConfig::default(),
+            file,
+            &ServerCliOverrides::default(),
+        );
+        let d = ServerConfig::default();
+        assert_eq!(merged.handshake, d.handshake);
+        assert_eq!(merged.crypto, d.crypto);
+        assert_eq!(merged.transport, d.transport);
+        assert_eq!(merged.congestion, d.congestion);
+        assert_eq!(merged.fec.scheme, d.fec.scheme);
+        assert!(!merged.handshake.propose, "proposing is opt-in");
+    }
+
+    #[test]
+    fn an_empty_profile_section_keeps_the_defaults() {
+        let file =
+            ServerFileConfig::from_toml("[handshake]\n[crypto]\n[transport]\n[congestion]\n")
+                .unwrap();
+        let merged = merge_server_config(
+            ServerConfig::default(),
+            file,
+            &ServerCliOverrides::default(),
+        );
+        let d = ServerConfig::default();
+        assert_eq!(merged.handshake, d.handshake);
+        assert_eq!(merged.crypto, d.crypto);
+        assert_eq!(merged.transport, d.transport);
+        assert_eq!(merged.congestion, d.congestion);
+    }
+
+    #[test]
+    fn a_partial_fec_section_leaves_the_other_scalars_alone() {
+        // `FecSection` is all-`Option`, so naming one key must not reset the rest
+        // to a serde default.
+        let file = ServerFileConfig::from_toml("[fec]\nmax_m = 7\n").unwrap();
+        let merged = merge_server_config(
+            ServerConfig::default(),
+            file,
+            &ServerCliOverrides::default(),
+        );
+        assert_eq!(merged.fec.max_m, 7);
+        assert_eq!(merged.fec.k, FecConfig::default().k);
+        assert_eq!(merged.fec.min_m, FecConfig::default().min_m);
+        assert_eq!(merged.fec.initial_m, FecConfig::default().initial_m);
+    }
+
+    /// `warn_unknown_keys` walks a static schema rather than rejecting, so a key
+    /// missing from a `SectionSchema` is *silently dropped with a warning*. That
+    /// makes the schema a real correctness dependency: forget a key there and a
+    /// valid config setting quietly does nothing.
+    ///
+    /// These tests assert every key of every profile section survives a
+    /// round-trip, which is what would break if the schema and the struct ever
+    /// drifted apart.
+    #[test]
+    fn every_profile_section_key_round_trips() {
+        let server = ServerFileConfig::from_toml(FULL_PROFILE_TOML).unwrap();
+        assert!(server.handshake.is_some());
+        assert!(server.crypto.is_some());
+        assert!(server.transport.is_some());
+        assert!(server.fec.is_some());
+        assert!(server.congestion.is_some());
+
+        let client = ClientFileConfig::from_toml(FULL_PROFILE_TOML).unwrap();
+        assert!(client.handshake.is_some());
+        assert!(client.crypto.is_some());
+        assert!(client.transport.is_some());
+        assert!(client.fec.is_some());
+        assert!(client.congestion.is_some());
+
+        // The schemas must list the same key names the structs declare, at the
+        // right nesting level. Assert them literally so adding a field without
+        // updating the schema fails here.
+        for schema in [
+            &HANDSHAKE_SCHEMA,
+            &CRYPTO_SCHEMA,
+            &TRANSPORT_SCHEMA,
+            &FEC_SCHEMA,
+            &CONGESTION_SCHEMA,
+        ] {
+            assert!(
+                schema.scalars.iter().all(|k| !k.is_empty()),
+                "schema keys must be non-empty"
+            );
+        }
+        assert_eq!(HANDSHAKE_SCHEMA.scalars, ["kex", "propose"]);
+        assert_eq!(CRYPTO_SCHEMA.scalars, ["aead"]);
+        assert_eq!(TRANSPORT_SCHEMA.scalars, ["handshake", "data", "tag_hex"]);
+        assert_eq!(
+            FEC_SCHEMA.scalars,
+            ["scheme", "k", "min_m", "max_m", "initial_m"]
+        );
+        assert_eq!(CONGESTION_SCHEMA.scalars, ["algorithm"]);
+
+        // And the sections must be reachable from the top level of both roles.
+        for tables in [&SERVER_SCHEMA.tables, &CLIENT_SCHEMA.tables] {
+            for name in ["handshake", "crypto", "transport", "fec", "congestion"] {
+                assert!(
+                    tables.iter().any(|(n, _)| *n == name),
+                    "[{name}] must be in the top-level schema tables"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_profile_config_resolves_to_a_usable_local_profile() {
+        // End-to-end through the real resolution path: a default config must
+        // produce a profile the daemon can actually run.
+        let defaults = ServerConfig::default();
+        let profile = crate::protocol::profile::LocalProfile::from_role_config(
+            &defaults.handshake,
+            &defaults.crypto,
+            &defaults.transport,
+            &defaults.fec,
+            &defaults.congestion,
+        )
+        .expect("the default config must resolve to a usable profile");
+        assert_eq!(
+            profile.kex_name,
+            crate::protocol::handshake::DEFAULT_HANDSHAKE
+        );
+        assert!(!profile.propose);
+        assert!(profile.offer().is_none());
+        assert_eq!(
+            profile.congestion_name,
+            crate::congestion::DEFAULT_CONGESTION
+        );
+    }
+
+    #[test]
+    fn a_config_file_profile_resolves_to_a_usable_local_profile() {
+        let file = ServerFileConfig::from_toml(FULL_PROFILE_TOML).unwrap();
+        let merged = merge_server_config(
+            ServerConfig::default(),
+            file,
+            &ServerCliOverrides::default(),
+        );
+        let profile = crate::protocol::profile::LocalProfile::from_role_config(
+            &merged.handshake,
+            &merged.crypto,
+            &merged.transport,
+            &merged.fec,
+            &merged.congestion,
+        )
+        .expect("a well-formed profile config must resolve");
+        assert!(profile.propose);
+        assert_eq!(profile.data_tag, [0xAB, 0xCD]);
+        assert_eq!(profile.congestion_name, "none");
+        let offer = profile.offer().unwrap();
+        assert_eq!(
+            offer.cipher_ids,
+            [crate::crypto::suite::CIPHER_CHACHA20POLY1305]
+        );
+        assert_eq!(offer.transport_ids, [crate::transport::TRANSPORT_TAGGED]);
+    }
+
+    #[test]
+    fn a_bad_part_name_fails_profile_resolution_not_just_parsing() {
+        // Parsing succeeds (the name is a string) but resolution must refuse it,
+        // with the offending string in the message.
+        let file = ServerFileConfig::from_toml("[crypto]\naead = [\"aes-gcm\"]\n").unwrap();
+        let merged = merge_server_config(
+            ServerConfig::default(),
+            file,
+            &ServerCliOverrides::default(),
+        );
+        let err = crate::protocol::profile::LocalProfile::from_role_config(
+            &merged.handshake,
+            &merged.crypto,
+            &merged.transport,
+            &merged.fec,
+            &merged.congestion,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("aes-gcm"), "got {err}");
+    }
+}
+
+#[cfg(test)]
+mod dist_template_tests {
+    //! The shipped `scripts/dist/*.toml` are the first config a new deployment
+    //! sees. If they fail to parse, or name a part that does not resolve, a
+    //! stock install breaks — so they are covered here rather than only by
+    //! inspection.
+
+    use super::*;
+
+    fn resolve(merged: &ServerConfig) {
+        crate::protocol::profile::LocalProfile::from_role_config(
+            &merged.handshake,
+            &merged.crypto,
+            &merged.transport,
+            &merged.fec,
+            &merged.congestion,
+        )
+        .unwrap_or_else(|e| panic!("shipped server.toml must resolve a usable profile: {e}"));
+    }
+
+    #[test]
+    fn the_shipped_server_template_resolves() {
+        let path = "scripts/dist/server.toml";
+        let file = match ServerFileConfig::load_or_empty(Path::new(path)) {
+            Ok(f) => f,
+            Err(e) => panic!("{path} must parse: {e}"),
+        };
+        let merged = merge_server_config(
+            ServerConfig::default(),
+            file,
+            &ServerCliOverrides::default(),
+        );
+        // The template documents the defaults explicitly, so it must agree with
+        // them — a stock install must not silently change behaviour.
+        assert_eq!(merged.handshake.kex, "noise-ik");
+        assert!(!merged.handshake.propose, "proposing stays opt-in");
+        assert_eq!(merged.crypto.aead, ["chacha20poly1305"]);
+        assert_eq!(merged.transport.handshake, "plain");
+        assert_eq!(merged.transport.data, ["same-as-handshake"]);
+        assert_eq!(merged.fec.scheme, ["reed-solomon"]);
+        assert_eq!(merged.congestion.algorithm, "tcp-reno");
+        resolve(&merged);
+    }
+
+    #[test]
+    fn the_shipped_client_template_resolves() {
+        let path = "scripts/dist/client.toml";
+        let file = match ClientFileConfig::load_or_empty(Path::new(path)) {
+            Ok(f) => f,
+            Err(e) => panic!("{path} must parse: {e}"),
+        };
+        let merged = merge_client_config(
+            ClientConfig::default(),
+            file,
+            &ClientCliOverrides::default(),
+        );
+        assert_eq!(merged.handshake.kex, "noise-ik");
+        assert!(!merged.handshake.propose);
+        assert_eq!(merged.crypto.aead, ["chacha20poly1305"]);
+        assert_eq!(merged.transport.handshake, "plain");
+        assert_eq!(merged.transport.data, ["same-as-handshake"]);
+        assert_eq!(merged.fec.scheme, ["reed-solomon"]);
+        assert_eq!(merged.congestion.algorithm, "tcp-reno");
+        crate::protocol::profile::LocalProfile::from_role_config(
+            &merged.handshake,
+            &merged.crypto,
+            &merged.transport,
+            &merged.fec,
+            &merged.congestion,
+        )
+        .unwrap_or_else(|e| panic!("shipped client.toml must resolve a usable profile: {e}"));
+    }
+
+    #[test]
+    fn both_templates_agree_on_the_config_pinned_parts() {
+        // The KEX and the handshake envelope must be named identically on both
+        // sides; nothing negotiates them, so a mismatch is a silent outage.
+        let s = merge_server_config(
+            ServerConfig::default(),
+            ServerFileConfig::load_or_empty(Path::new("scripts/dist/server.toml")).unwrap(),
+            &ServerCliOverrides::default(),
+        );
+        let c = merge_client_config(
+            ClientConfig::default(),
+            ClientFileConfig::load_or_empty(Path::new("scripts/dist/client.toml")).unwrap(),
+            &ClientCliOverrides::default(),
+        );
+        assert_eq!(s.handshake.kex, c.handshake.kex);
+        assert_eq!(s.transport.handshake, c.transport.handshake);
     }
 }

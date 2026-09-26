@@ -40,3 +40,46 @@ enabled = true
 # [[peers]]
 # public_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 # name = "alice"
+
+# ---------------------------------------------------------------------------
+# Protocol profile — which implementation of each swappable part a session
+# runs. See doc/profiles.md. Omitting this section entirely is equivalent to the
+# defaults shown here, which is the pre-negotiation protocol.
+# ---------------------------------------------------------------------------
+
+[handshake]
+# Key exchange. Must be named identically in the server's and the client's
+# config: it carries the profile negotiation, so it cannot itself be negotiated.
+# An unknown name is a hard error, not a fallback.
+kex = "noise-ik"
+
+[crypto]
+# Ordered preference list of per-packet AEAD ciphers; the first entry is the
+# default and the rest are fallbacks for a mixed-version fleet. The chosen suite
+# is negotiated and is bound into the transport-key derivation.
+aead = ["chacha20poly1305"]
+
+[transport]
+# Envelope for the handshake messages. Also must match on both peers.
+handshake = "plain"
+# Envelope for steady-state frames, as an ordered preference. "same-as-handshake"
+# reuses the handshake envelope and needs no negotiation at all.
+data = ["same-as-handshake"]
+# Two-byte framing tag for the "tagged" data envelope, as 4 hex digits. This is
+# a server-side setting: the tag travels inside the negotiation answer, so a
+# client never has to configure one. It does not affect the handshake envelope.
+# tag_hex = "abcd"
+
+[fec]
+# Erasure code, as an ordered preference. "none" disables parity entirely.
+scheme = ["reed-solomon"]
+# How much parity to send — a local sender policy, not negotiated.
+k = 1
+min_m = 0
+max_m = 4
+initial_m = 2
+
+[congestion]
+# Purely local (a congestion window is invisible to the peer). "none" disables
+# rate limiting; that is right on a LAN and wrong on a shared or lossy path.
+algorithm = "tcp-reno"

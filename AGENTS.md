@@ -51,7 +51,8 @@ src/
                       (KillSwitch), all behind a swappable FirewallBackend for testability
 tests/
   end_to_end.rs       loopback handshake + key-matching + kill-switch fail-closed drop tests
-doc/                  full design docs (start at doc/architecture.md)
+doc/                  full design docs (start at doc/architecture.md, then
+                      doc/profiles.md for the swappable parts)
 .github/workflows/    GitHub Actions: ci.yml (fmt/build/test + advisory clippy),
                       release.yml (tag-driven release artifact published to GitHub Releases)
 rust-toolchain.toml   pins the Rust toolchain (stable + rustfmt + clippy) for CI and local dev
@@ -77,8 +78,38 @@ rust-toolchain.toml   pins the Rust toolchain (stable + rustfmt + clippy) for CI
   `ObfuscationLayer` and slot into the stack from config without touching
   protocol/crypto/FEC/TUN. The stack is **off by default** and enabled only via
   the `[obfuscation]` TOML section. See `doc/obfuscation.md`.
+- **Every swappable part goes behind a trait + a name registry, and is built
+  from config — never from a `match` on a concrete type in the tunnel.** The
+  seams are `AeadCipher` (crypto/suite), `Transport` (transport), `FecScheme`
+  (fec), `CongestionControl` (congestion), `Handshake` (protocol/handshake) and
+  `ObfuscationLayer` (obfuscation). Each has a `build_*`/`select_*` registry and
+  a stable wire id. Adding an option must not require touching `tunnel/`,
+  `daemon/` or the config plumbing — see `doc/profiles.md`.
+- **A `Tunnel` holds one `ResolvedProfile`, not four separate fields.** That is
+  deliberate: it makes it impossible to build a tunnel that mixes one party's
+  cipher with another party's envelope. Congestion is the one exception to
+  "cheap to clone": controller state is per-tunnel, so `ResolvedProfile::clone`
+  rebuilds a fresh one.
+- **The negotiated cipher is bound into the transport keys.** The HKDF info is
+  `"rustnies-transport-keys" || suite.key_schedule()`. A peer that ends up with a
+  different suite therefore derives different keys, so a mismatch can only ever
+  surface as a tag failure on the first data packet. Do not "simplify" this back
+  to a constant info string.
+- **The server is authoritative in negotiation; the client may not be.** The
+  responder walks its own preference order first, then falls back to a
+  client-offered option it can run, then rejects. A profile is accepted or
+  rejected as a unit — never half-negotiated.
+- **An unknown part name is a hard error, not warn-and-skip** (the one exception
+  is `[obfuscation] layers`). A silent fallback leaves the peers in different
+  configurations, and the symptom is near-undiagnosable. Validate once at
+  `LocalProfile::from_role_config`, not per handshake.
 - **No invented cryptography.** Use Noise IK (already implemented), X25519,
   HKDF-SHA256, ChaCha20-Poly1305. Do not roll custom crypto.
+- **The negotiation channel is the Noise message payloads, so keep it
+  backwards compatible.** Message 2's payload slot is purely additive and always
+  safe. Message 1 has no payload slot, so appending one is a wire change: the
+  client's offer is opt-in via `[handshake] propose`, default `false`, which
+  keeps default-configured peers byte-identical to pre-negotiation builds.
 - **Data is best-effort; only control/handshake messages are reliable.**
   Reliability for data is the FEC layer's job, not a retransmission loop.
 - **Daemon owns state; CLI is a thin IPC client.** Never relaunch the VPN to
@@ -90,7 +121,7 @@ rust-toolchain.toml   pins the Rust toolchain (stable + rustfmt + clippy) for CI
 ```sh
 cargo build                      # debug build
 cargo build --release            # release build
-cargo test                       # all tests (418 passing)
+cargo test                       # all tests (558 passing)
 cargo test --lib                 # unit tests only
 cargo test --test end_to_end     # integration tests only
 
@@ -190,6 +221,11 @@ amend, force-push, or commit unrelated changes.
   so `src/crypto/noise.rs` uses `StaticSecret` for the ephemeral (freshly
   generated per handshake, zeroised on drop) and calls `diffie_hellman(&self)`.
   Do not "fix" this by switching back to `EphemeralSecret`.
+- **Message 1 has no Noise payload slot, but the profile offer is appended
+  anyway** (behind `[handshake] propose`, default `false`). `read_message_1`
+  therefore splits the buffer at `32 + 32 + TAG_LEN` before decrypting, rather
+  than handing `msg[32..]` to the AEAD whole. Do not "simplify" that back — it is
+  what makes a proposing client and a non-proposing one both parse correctly.
 - The Reed-Solomon generator must be built as `G = V * V_top^{-1}` (systematic).
   Do not try to row-reduce the Vandermonde parity rows against the identity
   block; that zeroes them.

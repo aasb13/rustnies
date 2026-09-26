@@ -304,10 +304,36 @@ A CLI flag only takes effect when actually passed, so an omitted flag does
 ### Unknown keys
 
 Unknown keys at any level (top-level sections, `[tun]` / `[nat]` /
-`[obfuscation]` sub-tables, or `[[peers]]` entries) produce a `WARN` log line
-but do **not** prevent the daemon from starting. This means a typo never
-locks you out of your own config. Check the daemon logs at startup for
+`[obfuscation]` / `[handshake]` / `[crypto]` / `[transport]` / `[fec]` /
+`[congestion]` sub-tables, or `[[peers]]` entries) produce a `WARN` log line but
+do **not** prevent the daemon from starting. This means a typo never locks you
+out of your own config. Check the daemon logs at startup for
 `unknown config key; ignored` warnings if a setting seems to have no effect.
+
+### Unknown part names are a *different* class of error
+
+A typo in a *key* is a `WARN` and is ignored. A typo in a *protocol part name*
+(`[crypto] aead = ["aes-gcm"]`, `[congestion] algorithm = "bbr"`,
+`[handshake] kex = "x25519"`) is a **hard error** and the daemon refuses to
+start, with the offending string in the message.
+
+This asymmetry is deliberate. An unknown key means a setting silently has no
+effect — annoying but recoverable. An unknown part name would otherwise leave
+the two peers in different configurations, and the symptom (a session that
+appears to connect and then drops every packet, or a handshake that times out
+with no diagnostic) is very hard to trace back to a typo. The one exception is
+`[obfuscation] layers`, where an unknown layer only degrades confidentiality and
+the tunnel still works, so it warns and skips.
+
+See [`profiles.md`](profiles.md) for the full list.
+
+### Protocol profile sections
+
+`[handshake]`, `[crypto]`, `[transport]`, `[fec] scheme` and `[congestion]`
+select which implementation of each swappable protocol part a session runs. They
+are **TOML only** — no CLI flags — and are documented in full in
+[`profiles.md`](profiles.md). Omitting them entirely leaves the pre-negotiation
+protocol, which is still what a stock install runs.
 
 ### Server config (`server.toml`)
 

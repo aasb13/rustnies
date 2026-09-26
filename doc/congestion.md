@@ -3,10 +3,44 @@
 rustnies ships a small, TCP-inspired congestion controller that responds to
 live RTT and loss measurements. It is a building block, not a high-performance
 design: phase 1 wants correct, well-behaved control, and a BBR-style controller
-can slot in later by replacing `CongestionController`.
+can slot in later by implementing the same trait.
 
-All congestion logic is in `src/congestion/mod.rs` and is independent of the
+Congestion control is the one swappable protocol part that is **purely local**
+and therefore *not* negotiated: a congestion window describes only what this
+sender has put on the wire and what came back, so there is nothing for the peer
+to agree on. Each side uses its own `[congestion] algorithm` setting. See
+[`profiles.md`](profiles.md).
+
+All congestion logic lives in `src/congestion/` and is independent of the
 protocol, crypto, FEC, and platform layers.
+
+## The seam
+
+`CongestionControl` (`src/congestion/mod.rs`) is the trait the tunnel holds as
+`Box<dyn CongestionControl>`. Implementations:
+
+- `tcp::CongestionController` — the controller described below; the default,
+  selected by `algorithm = "tcp-reno"`.
+- `NoCongestionControl` — `algorithm = "none"`. Unbounded window, no pacer. The
+  right choice when the bottleneck is the peer's receive rate rather than the
+  local path (e.g. a wired LAN), the wrong one on a shared or lossy path, where
+  an unbounded sender becomes queueing delay and then loss. A diagnostic and lab
+  aid, not a default. It still reports a fixed conservative RTO, because the
+  reliable-control retransmit path needs a value even with no window.
+
+State is per-tunnel and never shared: a server that serves many sessions builds
+one `LocalProfile` and calls `new_congestion()` per accepted handshake.
+
+Two rules in the trait are load-bearing for the tunnel's accounting, and a new
+implementation must preserve them:
+
+- `try_send_parity` is a **separate** admission test from `may_send`. Parity
+  belongs to an already-admitted data group, and must never be refused for
+  pacing reasons — dropping redundancy because of pacing would disable FEC
+  exactly when the path is busy. It refuses only on window exhaustion.
+- Every path that sends bytes after an admission check passed must have a
+  matching `refund_send_bytes` or `release` if the datagram is dropped
+  afterwards, or the window leaks credit.
 
 ## Design: bytes, not packets
 

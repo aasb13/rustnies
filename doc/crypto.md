@@ -12,7 +12,10 @@ cryptography is invented.
 | Secret zeroisation | `Zeroize` on `StaticSecret` / `HandshakeResult` | `zeroize` |
 | RNG | OS RNG (`OsRng`) | `rand` |
 
-All crypto lives in `src/crypto/`.
+All crypto lives in `src/crypto/`. The per-packet cipher is a swappable seam
+(`suite.rs`, `AeadCipher`) selected by config and negotiated in the handshake —
+ChaCha20-Poly1305 is the default and currently the only implementation. See
+[`profiles.md`](profiles.md).
 
 ## Noise IK handshake
 
@@ -75,7 +78,8 @@ After `Split()`, HKDF-SHA256 derives two 32-byte application keys from the
 final chaining key:
 
 ```
-okm = HKDF-Expand(ck, "rustnies-transport-keys", 64)
+info  = "rustnies-transport-keys" || <the negotiated suite's key_schedule()>
+okm   = HKDF-Expand(ck, info, 64)
 key_i2r = okm[ 0..32]   // initiator -> responder
 key_r2i = okm[32..64]   // responder -> initiator
 ```
@@ -83,9 +87,25 @@ key_r2i = okm[32..64]   // responder -> initiator
 `HandshakeResult` carries `key_i2r`, `key_r2i`, and the final `handshake_hash`
 (which binds the transcript and is used to derive the session id).
 
+The `key_schedule()` suffix is the cipher suite's domain-separation string
+(`AeadCipher::key_schedule` in `src/crypto/suite.rs`; for the default suite it
+is `"rustnies/aead/chacha20poly1305"`). Folding it into the HKDF `info` **binds
+the session keys to the agreed suite**: two peers that disagree about the cipher
+derive *different* keys, so the very first data packet fails its tag check. A
+suite mismatch can therefore only ever surface as an authentication failure,
+never as a session that appears to connect and then misbehaves.
+
+It also resolves an ordering problem. The suite is chosen by the responder and
+travels in message 2's payload, which the initiator has to decrypt *before* the
+keys exist. `read_message_2` therefore takes a closure over the freshly
+decrypted payload and derives the keys with whatever the payload says; the
+responder derived them the same way before encrypting it. See
+[`profiles.md`](profiles.md).
+
 ### Session id
 
-`session_id_from_hash(h)` takes the first 4 bytes of the handshake hash
+`protocol::session::session_id_from_hash(h)` takes the first 4 bytes of the
+handshake hash
 (big-endian) and returns a non-zero `u32`. Both sides derive the same id, which
 is carried in every packet header and folded into the AEAD nonce.
 

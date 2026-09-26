@@ -117,6 +117,7 @@ use crate::crypto::keys::KeyPair;
 use crate::obfuscation::{self, ObfuscationStack};
 use crate::protocol::SessionId;
 use crate::protocol::header::{HEADER_LEN, PROTOCOL_VERSION, PacketType};
+use crate::protocol::profile::{LocalProfile, ResolvedProfile};
 use crate::protocol::session::{Session, SessionRole};
 use crate::stats::Counters;
 use crate::transport::Transport;
@@ -385,7 +386,7 @@ pub async fn run_server(
     sock: Arc<UdpSocket>,
     server_kp: KeyPair,
     mut tun: Box<dyn Tun>,
-    transport: Box<dyn Transport>,
+    profile: LocalProfile,
     obf_stack: obfuscation::SharedStack,
     mut stop: watch::Receiver<bool>,
     stop_tx: watch::Sender<bool>,
@@ -620,7 +621,7 @@ pub async fn run_server(
                          // 4. Otherwise drop as scan noise.
                          let mut forwarded = false;
                          if let Some(sid) =
-                             peek_routed_session(&sessions, &*transport, datagram)
+                             peek_routed_session(&sessions, &*profile.handshake_transport, datagram)
                          {
                              if let Some(h) = sessions.get_mut(&sid) {
                                  if h.udp_tx.try_send((datagram.to_vec(), from)).is_ok() {
@@ -643,13 +644,12 @@ pub async fn run_server(
                              if probe_limiter.allow(from) {
                                  let is_handshake = self::handle_handshake(
                                      &server_kp,
-                                     &*transport,
+                                     &profile,
                                      &obf_stack,
                                      datagram,
                                      from,
                                      &peer_auth,
                                      sock.clone(),
-                                     transport.boxed_clone(),
                                      obf_stack.clone(),
                                      counters.clone(),
                                      tun_write_tx.clone(),
@@ -751,13 +751,12 @@ pub async fn run_server(
 #[allow(clippy::too_many_arguments)]
 async fn handle_handshake(
     server_kp: &KeyPair,
-    transport: &dyn Transport,
+    profile: &LocalProfile,
     obf_stack: &obfuscation::SharedStack,
     datagram: &[u8],
     from: SocketAddr,
     peer_auth: &Arc<StdMutex<PeerAuth>>,
     sock: Arc<UdpSocket>,
-    tunnel_transport: Box<dyn Transport>,
     tunnel_obf_stack: obfuscation::SharedStack,
     counters: Arc<Mutex<Counters>>,
     tun_write_tx: mpsc::Sender<(SessionId, Vec<u8>)>,
@@ -776,8 +775,7 @@ async fn handle_handshake(
     } else {
         Some(&|pk| auth_guard.check(pk))
     };
-    match handshake::respond_message_1(server_kp, transport, obf_stack, datagram, from, authorizer)
-    {
+    match handshake::respond_message_1(server_kp, profile, obf_stack, datagram, from, authorizer) {
         Some((established, m2_wire)) => {
             if let Err(e) = sock.send_to(&m2_wire, from).await {
                 tracing::warn!(
@@ -812,9 +810,36 @@ async fn handle_handshake(
             // authenticates the original header.
             let pub_route_keystream =
                 extract_header_xor_keystream(&established.handshake_hash, &obf_stack);
+            // Build this session's runnable profile from the negotiated
+            // selection. The congestion controller is per-tunnel state, so a
+            // fresh one is created here rather than shared from the server's
+            // `LocalProfile`.
+            let resolved = match ResolvedProfile::with_handshake_transport(
+                &established.selection,
+                &established.handshake_hash,
+                &*profile.handshake_transport,
+                profile.new_congestion(),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        peer = %from,
+                        error = %e,
+                        "negotiated profile cannot be instantiated; dropping client"
+                    );
+                    let mut c = counters.lock().await;
+                    c.handshake_errors = c.handshake_errors.saturating_add(1);
+                    return false;
+                }
+            };
+            tracing::info!(
+                peer = %from,
+                profile = %resolved.describe(),
+                "session profile instantiated"
+            );
             spawn_client(
                 sock,
-                tunnel_transport,
+                resolved,
                 session_stack,
                 established,
                 counters.clone(),
@@ -854,7 +879,7 @@ async fn handle_handshake(
 #[allow(clippy::too_many_arguments)]
 fn spawn_client(
     sock: Arc<UdpSocket>,
-    transport: Box<dyn Transport>,
+    profile: ResolvedProfile,
     obfuscation: ObfuscationStack,
     established: handshake::SessionEstablished,
     counters: Arc<Mutex<Counters>>,
@@ -890,7 +915,7 @@ fn spawn_client(
         sock,
         peer,
         session,
-        transport,
+        profile,
         obfuscation,
         established.send_key,
         established.recv_key,
@@ -912,13 +937,9 @@ fn spawn_client(
     // this tunnel to tear down gracefully (cap eviction, revocation, disconnect).
     tunnel.set_evict_rx(evict_rx);
 
-    // Apply FEC settings from the resolved config.
-    tunnel.configure_fec(
-        fec_config.k,
-        fec_config.min_m,
-        fec_config.max_m,
-        fec_config.initial_m,
-    );
+    // Apply FEC settings from the resolved config. The erasure code itself came
+    // from the negotiated profile; these are the local tuning parameters.
+    tunnel.configure_fec(&fec_config);
 
     let stop_rx = stop_tx.subscribe();
     let join = tokio::spawn(async move {

@@ -45,6 +45,18 @@ pub trait Transport: Send + Sync + 'static {
     /// plaintext frame for [`crate::protocol::codec::decode`].
     fn unwrap(&self, datagram: &[u8]) -> Result<Vec<u8>, TransportError>;
 
+    /// Derive per-session keying material from the handshake hash. Called once
+    /// per session, after the handshake completes and before the first
+    /// steady-state frame, mirroring
+    /// [`crate::obfuscation::ObfuscationLayer::init`]. A transport that needs
+    /// session-derived keys (e.g. to mask a marker) overrides this; a stateless
+    /// transport leaves the default no-op in place.
+    ///
+    /// Note this is **not** called for the handshake transport: it wraps
+    /// message 1 and message 2, which must be encoded before any session hash
+    /// exists. Handshake transports are therefore required to be unkeyed.
+    fn init(&self, _session_seed: &[u8; 32]) {}
+
     /// Boxed clone so a transport can be held behind a trait object and
     /// duplicated across tasks.
     fn boxed_clone(&self) -> Box<dyn Transport>;
@@ -111,6 +123,120 @@ impl Transport for TaggedTransport {
 /// Convenience: produce the default plain transport.
 pub fn default_transport() -> Box<dyn Transport> {
     Box::new(PlainTransport)
+}
+
+// ---------------------------------------------------------------------------
+// Config-driven selection
+// ---------------------------------------------------------------------------
+//
+// A transport is chosen by name from the `[transport]` config section, using the
+// same name-to-type registry shape as `obfuscation::build_stack`: a plain
+// `match` over `&str`, a warn-and-skip for an unknown name (a bad transport
+// name degrades to plain rather than preventing the tunnel from coming up),
+// and a `boxed_clone` so each session gets its own copy.
+//
+// Unlike `[obfuscation]`, `[transport]` has two entries because the handshake
+// and steady-state datagrams can legitimately use different envelopes:
+//   * `handshake` wraps message 1 / message 2, which are encoded *before* any
+//     session key material exists, so it is config-only and must match on both
+//     peers. There is nothing to negotiate it against.
+//   * `data` wraps steady-state frames and *is* negotiated, because by then the
+//     session exists and the server's pick can be echoed in message 2.
+
+/// Default transport name, also the fallback for an empty config value.
+pub const DEFAULT_TRANSPORT: &str = "plain";
+
+/// The `data` preference entry that means "reuse the handshake transport".
+///
+/// With this selected (and no other `data` entry) there is nothing to
+/// negotiate: both peers already agree because the handshake envelope is
+/// config-pinned. See [`crate::protocol::profile`].
+pub const TRANSPORT_SAME_AS_HANDSHAKE: &str = "same-as-handshake";
+
+/// Resolve a transport config name to a boxed implementation.
+///
+/// `tag` supplies the framing marker for `"tagged"`; it is ignored by every
+/// other implementation. An unknown name is logged at `warn` and falls back to
+/// [`PlainTransport`], so a typo degrades the envelope rather than breaking
+/// connectivity — the same warn-and-skip policy the obfuscation registry uses.
+pub fn build_transport(name: &str, tag: [u8; 2]) -> Box<dyn Transport> {
+    match name.trim() {
+        "" | DEFAULT_TRANSPORT => Box::new(PlainTransport),
+        "tagged" => Box::new(TaggedTransport { tag }),
+        other => {
+            tracing::warn!(
+                transport = other,
+                "unknown transport name in [transport]; falling back to plain"
+            );
+            Box::new(PlainTransport)
+        }
+    }
+}
+
+/// Build a transport from config and seed it with the per-session hash, for a
+/// steady-state (post-handshake) envelope.
+pub fn build_session_transport(
+    name: &str,
+    tag: [u8; 2],
+    session_seed: &[u8; 32],
+) -> Box<dyn Transport> {
+    let t = build_transport(name, tag);
+    t.init(session_seed);
+    t
+}
+
+/// Marker bytes used by [`TaggedTransport`] when `[transport] tag_hex` is unset.
+pub const DEFAULT_TAG: [u8; 2] = [0x52, 0x4E]; // "RN"
+
+/// Transport ids on the negotiation wire. See [`crate::protocol::profile`].
+pub const TRANSPORT_PLAIN: u8 = 1;
+pub const TRANSPORT_TAGGED: u8 = 2;
+
+/// Map a transport config name to its negotiation wire id. `None` means this
+/// build does not implement it. An empty name resolves to plain.
+pub fn transport_id(name: &str) -> Option<u8> {
+    match name.trim() {
+        "" | DEFAULT_TRANSPORT => Some(TRANSPORT_PLAIN),
+        "tagged" => Some(TRANSPORT_TAGGED),
+        _ => None,
+    }
+}
+
+/// The config name for a negotiation wire id, or `None` if unimplemented.
+pub fn transport_name(id: u8) -> Option<&'static str> {
+    match id {
+        TRANSPORT_PLAIN => Some(DEFAULT_TRANSPORT),
+        TRANSPORT_TAGGED => Some("tagged"),
+        _ => None,
+    }
+}
+
+/// Build a transport from a negotiation wire id, for the receiving side.
+///
+/// Returns `None` for an id this build does not implement, which the caller
+/// turns into a `ProfileError::UnsupportedPart`. `tag` is only consumed by
+/// `"tagged"`.
+pub fn build_transport_id(id: u8, tag: [u8; 2]) -> Option<Box<dyn Transport>> {
+    match id {
+        TRANSPORT_PLAIN => Some(Box::new(PlainTransport)),
+        TRANSPORT_TAGGED => Some(Box::new(TaggedTransport { tag })),
+        _ => None,
+    }
+}
+
+/// Parse an optional `tag_hex` config value into a 2-byte framing tag.
+///
+/// An absent or empty value yields [`DEFAULT_TAG`]. Anything else must be
+/// exactly 4 hex digits. This is a **server-side** setting: the tag travels in
+/// the server's [`crate::protocol::Selection`], so a client never has to
+/// configure one. It does not affect the handshake transport, which is
+/// config-pinned and uses [`DEFAULT_TAG`] on both peers.
+pub fn parse_tag(hex_str: Option<&str>) -> Result<[u8; 2], TransportError> {
+    let Some(s) = hex_str.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(DEFAULT_TAG);
+    };
+    let bytes = hex::decode(s).map_err(|_| TransportError::UnwrapFailed)?;
+    bytes.try_into().map_err(|_| TransportError::UnwrapFailed)
 }
 
 #[cfg(test)]
@@ -233,5 +359,85 @@ mod tests {
         let plain = PlainTransport;
         let tagged = TaggedTransport { tag: [0, 0] };
         assert_ne!(plain.name(), tagged.name());
+    }
+
+    // ---- Config-driven selection ----
+
+    #[test]
+    fn build_transport_resolves_known_names() {
+        assert_eq!(
+            build_transport(DEFAULT_TRANSPORT, DEFAULT_TAG).name(),
+            "plain"
+        );
+        assert_eq!(build_transport("", DEFAULT_TAG).name(), "plain");
+        assert_eq!(build_transport("tagged", [0xAA, 0xBB]).name(), "tagged");
+    }
+
+    #[test]
+    fn build_transport_falls_back_on_unknown_name() {
+        // Warn-and-skip: a typo must not prevent the tunnel coming up.
+        assert_eq!(build_transport("tls-front", DEFAULT_TAG).name(), "plain");
+    }
+
+    #[test]
+    fn build_transport_honours_tag() {
+        let t = build_transport("tagged", [0xAA, 0xBB]);
+        let wire = t.wrap(b"x");
+        assert_eq!(&wire[..2], &[0xAA, 0xBB]);
+        assert_eq!(t.unwrap(&wire).unwrap(), b"x");
+    }
+
+    #[test]
+    fn build_transport_id_roundtrips_names() {
+        for id in [TRANSPORT_PLAIN, TRANSPORT_TAGGED] {
+            let name = transport_name(id).unwrap();
+            assert_eq!(transport_id(name), Some(id));
+            assert_eq!(build_transport_id(id, DEFAULT_TAG).unwrap().name(), name);
+        }
+        assert_eq!(transport_id(""), Some(TRANSPORT_PLAIN));
+        assert_eq!(transport_id("tls-front"), None);
+    }
+
+    #[test]
+    fn build_transport_id_rejects_unknown_id() {
+        assert!(build_transport_id(0, DEFAULT_TAG).is_none());
+        assert!(build_transport_id(200, DEFAULT_TAG).is_none());
+        assert_eq!(transport_name(200), None);
+    }
+
+    #[test]
+    fn build_transport_id_honours_negotiated_tag() {
+        let t = build_transport_id(TRANSPORT_TAGGED, [0x99, 0x88]).unwrap();
+        let wire = t.wrap(b"z");
+        assert_eq!(&wire[..2], &[0x99, 0x88]);
+        assert_eq!(t.unwrap(&wire).unwrap(), b"z");
+    }
+
+    #[test]
+    fn parse_tag_defaults_and_validates() {
+        assert_eq!(parse_tag(None).unwrap(), DEFAULT_TAG);
+        assert_eq!(parse_tag(Some("")).unwrap(), DEFAULT_TAG);
+        assert_eq!(parse_tag(Some("  ")).unwrap(), DEFAULT_TAG);
+        assert_eq!(parse_tag(Some("abcd")).unwrap(), [0xAB, 0xCD]);
+        // Must be exactly two bytes of hex.
+        assert!(parse_tag(Some("ab")).is_err());
+        assert!(parse_tag(Some("abcde")).is_err());
+        assert!(parse_tag(Some("zzzz")).is_err());
+    }
+
+    #[test]
+    fn build_session_transport_seeds_via_init() {
+        // PlainTransport ignores the seed; the call must still be a no-op that
+        // returns a working transport.
+        let t = build_session_transport(DEFAULT_TRANSPORT, DEFAULT_TAG, &[7u8; 32]);
+        assert_eq!(t.name(), "plain");
+        assert_eq!(t.unwrap(&t.wrap(b"ok")).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn plain_transport_init_is_a_noop() {
+        let t = PlainTransport;
+        t.init(&[0u8; 32]);
+        assert_eq!(t.wrap(b"a"), b"a");
     }
 }

@@ -68,12 +68,12 @@ pub const MAX_PAYLOAD: usize = 1400 - HEADER_LEN - AEAD_TAG_LEN;
 pub type SessionId = u32;
 
 bitflags::bitflags! {
-    /// Reserved header flag bits.
+    /// Reserved header flag bits. All bits are currently unassigned; a receiver
+    /// silently drops unknown bits (`from_bits_truncate`), so a future flag is
+    /// backwards compatible.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     pub struct HeaderFlags: u8 {
         const NONE = 0;
-        /// Set on retransmitted control packets so the peer can dedupe.
-        const RETRANSMIT = 1 << 0;
     }
 }
 
@@ -248,7 +248,7 @@ mod tests {
         h.fec_index = 3;
         h.fec_k = 4;
         h.fec_m = 2;
-        h.flags = HeaderFlags::RETRANSMIT;
+        h.flags = HeaderFlags::NONE;
         h
     }
 
@@ -376,16 +376,18 @@ mod tests {
 
     #[test]
     fn header_flags_roundtrip_via_from_bits_truncate() {
-        // RETRANSMIT bit survives a write/read cycle.
+        // No flag bits are assigned yet, so a written header reads back empty.
         let h = sample_header();
         let mut buf = [0u8; HEADER_LEN];
         h.write_to(&mut buf).unwrap();
         let h2 = PacketHeader::read_from(&buf).unwrap();
-        assert_eq!(h2.flags, HeaderFlags::RETRANSMIT);
-        // Unknown flag bits are silently dropped (from_bits_truncate).
+        assert_eq!(h2.flags, HeaderFlags::NONE);
+        // Unknown flag bits are silently dropped rather than rejected
+        // (from_bits_truncate), which is what makes a future flag backwards
+        // compatible with an older receiver.
         buf[23] = 0xFF;
         let h3 = PacketHeader::read_from(&buf).unwrap();
-        assert_eq!(h3.flags, HeaderFlags::RETRANSMIT, "unknown bits dropped");
+        assert_eq!(h3.flags, HeaderFlags::NONE, "unknown bits dropped");
     }
 
     #[test]
@@ -430,8 +432,8 @@ mod tests {
         assert_eq!(buf[20], 3);
         assert_eq!(buf[21], 4);
         assert_eq!(buf[22], 2);
-        // flags
-        assert_eq!(buf[23], HeaderFlags::RETRANSMIT.bits());
+        // flags (no bits are assigned yet)
+        assert_eq!(buf[23], HeaderFlags::NONE.bits());
     }
 
     #[test]

@@ -15,11 +15,13 @@ use rustnies::crypto::noise::{HandshakeRole, NoiseHandshake};
 use rustnies::obfuscation::ObfuscationStack;
 use rustnies::platform::LinuxTunFactory;
 use rustnies::platform::linux::{Decision, KillSwitch, RecordedBackend, evaluate_packet};
+use rustnies::protocol::profile::{LocalProfile, ResolvedProfile};
+use rustnies::protocol::session::session_id_from_hash;
 use rustnies::protocol::session::{Session, SessionRole};
 use rustnies::stats::Counters;
 use rustnies::transport::default_transport;
 use rustnies::tun::{Tun, TunFactory, TunFut};
-use rustnies::tunnel::{Tunnel, TunnelExit, handshake, session_id_from_hash};
+use rustnies::tunnel::{Tunnel, TunnelExit, handshake};
 
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc, watch};
@@ -108,7 +110,7 @@ async fn end_to_end_handshake_and_data() {
         handshake::server(
             server_sock.clone(),
             server_kp_clone,
-            default_transport(),
+            default_profile(),
             &ObfuscationStack::new(),
         )
         .await
@@ -123,7 +125,7 @@ async fn end_to_end_handshake_and_data() {
             server_addr,
             &client_kp,
             server_kp.public,
-            default_transport(),
+            &default_profile(),
             &ObfuscationStack::new(),
         ),
     )
@@ -160,6 +162,10 @@ async fn end_to_end_handshake_and_data() {
 /// routed through the tunnel's handshake helpers' underlying types.
 #[tokio::test]
 async fn noise_handshake_keys_match() {
+    // The transport-key HKDF context production supplies from the negotiated
+    // suite. Both peers must use the same one, or the derived keys diverge.
+    const SCHEDULE: &[u8] = b"rustnies/aead/chacha20poly1305";
+
     let server = KeyPair::generate();
     let client = KeyPair::generate();
 
@@ -170,10 +176,10 @@ async fn noise_handshake_keys_match() {
     );
     let mut resp = NoiseHandshake::new(HandshakeRole::Responder, clone_keypair(&server), None);
 
-    let m1 = init.write_message_1().unwrap();
+    let m1 = init.write_message_1(&[]).unwrap();
     let _ = resp.read_message_1(&m1).unwrap();
-    let (m2, sr) = resp.write_message_2(b"hi").unwrap();
-    let (payload, cr) = init.read_message_2(&m2).unwrap();
+    let (m2, sr) = resp.write_message_2(b"hi", SCHEDULE).unwrap();
+    let (payload, cr) = init.read_message_2(&m2, |_| SCHEDULE.to_vec()).unwrap();
 
     assert_eq!(payload, b"hi");
     assert_eq!(cr.key_i2r, sr.key_i2r);
@@ -188,6 +194,35 @@ async fn noise_handshake_keys_match() {
     let _s = Session::new(id, SessionRole::Responder);
     // Direction enum is usable.
     let _d = Direction::InitiatorToResponder;
+}
+
+/// The rustnies default profile, built through the same
+/// `LocalProfile::from_role_config` path the daemon uses with an empty config.
+/// Tests that want a non-default profile build one explicitly.
+fn default_profile() -> LocalProfile {
+    LocalProfile::from_role_config(
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+    )
+    .expect("the default config must resolve to a usable profile")
+}
+
+/// Instantiate the profile both peers agreed on, exactly as the daemon does
+/// after a handshake.
+fn resolved_profile(
+    local: &LocalProfile,
+    established: &handshake::SessionEstablished,
+) -> ResolvedProfile {
+    ResolvedProfile::with_handshake_transport(
+        &established.selection,
+        &established.handshake_hash,
+        &*local.handshake_transport,
+        local.new_congestion(),
+    )
+    .expect("the negotiated selection must be instantiable on both ends")
 }
 
 fn clone_keypair(kp: &KeyPair) -> KeyPair {
@@ -226,13 +261,13 @@ async fn handshake_rejected_for_unauthorized_key() {
         clone_keypair(&rogue_client),
         Some(server_kp.public),
     );
-    let rogue_m1 = rogue_hs.write_message_1().unwrap();
+    let rogue_m1 = rogue_hs.write_message_1(&[]).unwrap();
     let rogue_wire = default_transport().wrap(&rogue_m1);
 
     // The server should reject it.
     let result = handshake::respond_message_1(
         &server_kp,
-        &*default_transport(),
+        &default_profile(),
         &ObfuscationStack::new(),
         &rogue_wire,
         "127.0.0.1:9999".parse().unwrap(),
@@ -249,13 +284,13 @@ async fn handshake_rejected_for_unauthorized_key() {
         clone_keypair(&authorized_client),
         Some(server_kp.public),
     );
-    let good_m1 = good_hs.write_message_1().unwrap();
+    let good_m1 = good_hs.write_message_1(&[]).unwrap();
     let good_wire = default_transport().wrap(&good_m1);
 
     // The server should accept it and produce message 2.
     let result = handshake::respond_message_1(
         &server_kp,
-        &*default_transport(),
+        &default_profile(),
         &ObfuscationStack::new(),
         &good_wire,
         "127.0.0.1:8888".parse().unwrap(),
@@ -289,12 +324,12 @@ async fn handshake_open_mode_accepts_all() {
         clone_keypair(&client_kp),
         Some(server_kp.public),
     );
-    let m1 = hs.write_message_1().unwrap();
+    let m1 = hs.write_message_1(&[]).unwrap();
     let wire = default_transport().wrap(&m1);
 
     let result = handshake::respond_message_1(
         &server_kp,
-        &*default_transport(),
+        &default_profile(),
         &ObfuscationStack::new(),
         &wire,
         "127.0.0.1:7777".parse().unwrap(),
@@ -375,7 +410,7 @@ async fn kill_switch_fail_closed_on_real_tunnel_drop() {
             handshake::server(
                 sock,
                 server_kp_clone,
-                default_transport(),
+                default_profile(),
                 &ObfuscationStack::new(),
             )
             .await
@@ -389,7 +424,7 @@ async fn kill_switch_fail_closed_on_real_tunnel_drop() {
             server_addr,
             &client_kp,
             server_kp.public,
-            default_transport(),
+            &default_profile(),
             &ObfuscationStack::new(),
         ),
     )
@@ -419,7 +454,7 @@ async fn kill_switch_fail_closed_on_real_tunnel_drop() {
         client_sock.clone(),
         established_client.peer,
         Session::new(established_client.session_id, SessionRole::Initiator),
-        default_transport(),
+        resolved_profile(&default_profile(), &established_client),
         ObfuscationStack::new(),
         established_client.send_key,
         established_client.recv_key,
@@ -645,7 +680,7 @@ async fn bidirectional_data_through_two_tunnels() {
         handshake::server(
             server_sock_for_hs,
             server_kp_clone,
-            default_transport(),
+            default_profile(),
             &ObfuscationStack::new(),
         )
         .await
@@ -658,7 +693,7 @@ async fn bidirectional_data_through_two_tunnels() {
             server_addr,
             &client_kp,
             server_kp.public,
-            default_transport(),
+            &default_profile(),
             &ObfuscationStack::new(),
         ),
     )
@@ -694,7 +729,7 @@ async fn bidirectional_data_through_two_tunnels() {
         client_sock.clone(),
         established_client.peer,
         Session::new(established_client.session_id, SessionRole::Initiator),
-        default_transport(),
+        resolved_profile(&default_profile(), &established_client),
         ObfuscationStack::new(),
         established_client.send_key,
         established_client.recv_key,
@@ -708,7 +743,7 @@ async fn bidirectional_data_through_two_tunnels() {
         server_sock.clone(),
         established_server.peer,
         Session::new(established_server.session_id, SessionRole::Responder),
-        default_transport(),
+        resolved_profile(&default_profile(), &established_server),
         ObfuscationStack::new(),
         established_server.send_key,
         established_server.recv_key,
@@ -810,7 +845,7 @@ async fn data_flows_through_server_dispatcher() {
                     server_sock.clone(),
                     server_kp,
                     server_tun,
-                    default_transport(),
+                    default_profile(),
                     rustnies::obfuscation::build_shared_stack(None),
                     stop_rx,
                     stop_tx,
@@ -837,7 +872,7 @@ async fn data_flows_through_server_dispatcher() {
                     server_addr,
                     &client_kp,
                     server_pub,
-                    default_transport(),
+                    &default_profile(),
                     &ObfuscationStack::new(),
                 ),
             )
@@ -860,7 +895,7 @@ async fn data_flows_through_server_dispatcher() {
                 client_sock.clone(),
                 established.peer,
                 Session::new(established.session_id, SessionRole::Initiator),
-                default_transport(),
+                resolved_profile(&default_profile(), &established),
                 ObfuscationStack::new(),
                 established.send_key,
                 established.recv_key,
@@ -1092,7 +1127,7 @@ async fn build_lossy_two_tunnels(
         handshake::server(
             server_sock_for_hs,
             server_kp_clone,
-            default_transport(),
+            default_profile(),
             &ObfuscationStack::new(),
         )
         .await
@@ -1105,7 +1140,7 @@ async fn build_lossy_two_tunnels(
             relay_addr,
             &client_kp,
             server_pub,
-            default_transport(),
+            &default_profile(),
             &ObfuscationStack::new(),
         ),
     )
@@ -1141,7 +1176,7 @@ async fn build_lossy_two_tunnels(
         client_sock.clone(),
         established_client.peer,
         Session::new(established_client.session_id, SessionRole::Initiator),
-        default_transport(),
+        resolved_profile(&default_profile(), &established_server),
         ObfuscationStack::new(),
         established_client.send_key,
         established_client.recv_key,
@@ -1155,7 +1190,7 @@ async fn build_lossy_two_tunnels(
         server_sock.clone(),
         established_server.peer,
         Session::new(established_server.session_id, SessionRole::Responder),
-        default_transport(),
+        resolved_profile(&default_profile(), &established_server),
         ObfuscationStack::new(),
         established_server.send_key,
         established_server.recv_key,
@@ -1167,8 +1202,20 @@ async fn build_lossy_two_tunnels(
     // Fix FEC parity at `fec_m` for both tunnels (k=1, min_m = max_m = fec_m).
     // With k=1 every packet is its own complete FEC group, so each packet gets
     // 1 + fec_m copies on the wire and FEC recovers from any single survivor.
-    client_tunnel.configure_fec(1, fec_m, fec_m, fec_m);
-    server_tunnel.configure_fec(1, fec_m, fec_m, fec_m);
+    client_tunnel.configure_fec(&rustnies::config::FecConfig {
+        scheme: vec![rustnies::fec::DEFAULT_FEC_SCHEME.to_string()],
+        k: 1,
+        min_m: fec_m,
+        max_m: fec_m,
+        initial_m: fec_m,
+    });
+    server_tunnel.configure_fec(&rustnies::config::FecConfig {
+        scheme: vec![rustnies::fec::DEFAULT_FEC_SCHEME.to_string()],
+        k: 1,
+        min_m: fec_m,
+        max_m: fec_m,
+        initial_m: fec_m,
+    });
     client_tunnel.set_keepalive_params(keepalive, session_timeout);
     server_tunnel.set_keepalive_params(keepalive, session_timeout);
 
@@ -1564,4 +1611,285 @@ async fn low_rate_flow_over_high_rtt_link_loses_nothing() {
         "tunnels must stay up for the whole run"
     );
     env.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Non-default protocol profiles, end to end
+// ---------------------------------------------------------------------------
+
+/// Build a client/server profile pair from the four config sections, exactly as
+/// the daemon does. `local_profile()` above is the same call with empty
+/// sections.
+fn profile_from(
+    handshake: rustnies::config::HandshakeConfig,
+    crypto: rustnies::config::CryptoConfig,
+    transport: rustnies::config::TransportConfig,
+    fec: rustnies::config::FecConfig,
+    congestion: rustnies::config::CongestionConfig,
+) -> LocalProfile {
+    LocalProfile::from_role_config(&handshake, &crypto, &transport, &fec, &congestion)
+        .expect("test profile must resolve")
+}
+
+/// A full loopback session over a deliberately non-default profile: FEC off,
+/// congestion control off, a `tagged` steady-state envelope, and a proposing
+/// client so the negotiation actually runs in both directions.
+///
+/// This is the test that would fail if any layer kept reaching for a hard-wired
+/// implementation: the cipher, the envelope and the erasure code all come from
+/// the negotiated selection, and the tunnel still has to deliver data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_flows_over_a_non_default_negotiated_profile() {
+    let client_profile = profile_from(
+        rustnies::config::HandshakeConfig {
+            kex: "noise-ik".into(),
+            // Propose, so the server's preference order is actually exercised
+            // against a client that advertises its own capabilities.
+            propose: true,
+        },
+        rustnies::config::CryptoConfig::default(),
+        rustnies::config::TransportConfig {
+            handshake: "plain".into(),
+            // Ask for the tagged envelope for steady-state frames.
+            data: vec!["tagged".into()],
+            tag_hex: None,
+        },
+        rustnies::config::FecConfig {
+            scheme: vec!["none".into()],
+            k: 1,
+            min_m: 0,
+            max_m: 4,
+            initial_m: 2,
+        },
+        rustnies::config::CongestionConfig {
+            algorithm: "none".into(),
+        },
+    );
+    // The server prefers the tagged envelope and agrees to turn FEC off. Built
+    // by a function because the responder and the post-handshake profile
+    // instantiation each need their own copy.
+    fn server_profile() -> LocalProfile {
+        profile_from(
+            rustnies::config::HandshakeConfig {
+                kex: "noise-ik".into(),
+                propose: false,
+            },
+            rustnies::config::CryptoConfig::default(),
+            rustnies::config::TransportConfig {
+                handshake: "plain".into(),
+                data: vec!["tagged".into(), "same-as-handshake".into()],
+                tag_hex: Some("beef".into()),
+            },
+            rustnies::config::FecConfig {
+                scheme: vec!["none".into()],
+                ..Default::default()
+            },
+            rustnies::config::CongestionConfig {
+                algorithm: "none".into(),
+            },
+        )
+    }
+
+    // --- handshake over loopback UDP ---
+    let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let server_addr = server_sock.local_addr().unwrap();
+    let server_kp = KeyPair::generate();
+    let client_kp = KeyPair::generate();
+    let server_pub = server_kp.public;
+
+    let obf = ObfuscationStack::new();
+    let server_task = {
+        let obf = ObfuscationStack::new();
+        let sock = server_sock.clone();
+        let kp = clone_keypair(&server_kp);
+        tokio::spawn(async move {
+            handshake::server(sock, kp, server_profile(), &obf)
+                .await
+                .expect("server handshake failed")
+        })
+    };
+    let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let established_client = tokio::time::timeout(
+        Duration::from_secs(10),
+        handshake::client(
+            client_sock.clone(),
+            server_addr,
+            &client_kp,
+            server_pub,
+            &client_profile,
+            &obf,
+        ),
+    )
+    .await
+    .expect("client handshake timed out")
+    .expect("client handshake failed");
+    let established_server = tokio::time::timeout(Duration::from_secs(10), server_task)
+        .await
+        .expect("server task join timed out")
+        .expect("server task panicked");
+
+    // --- the negotiation produced the profile we asked for ---
+    let sel = established_client.selection;
+    assert_eq!(sel, established_server.selection, "both ends agreed");
+    assert_eq!(
+        sel.fec,
+        rustnies::fec::FEC_NONE_ID,
+        "FEC was negotiated off"
+    );
+    assert_eq!(sel.transport, rustnies::transport::TRANSPORT_TAGGED);
+    assert_eq!(
+        sel.transport_tag,
+        [0xBE, 0xEF],
+        "the server's tag_hex was carried in the selection, not configured on the client"
+    );
+    assert_eq!(sel.cipher, rustnies::crypto::suite::CIPHER_CHACHA20POLY1305);
+    assert_eq!(established_client.session_id, established_server.session_id);
+    assert_eq!(established_client.send_key, established_server.recv_key);
+
+    // --- both ends instantiate an identical runnable profile ---
+    let client_resolved = resolved_profile(&client_profile, &established_client);
+    let server_resolved = resolved_profile(&server_profile(), &established_server);
+    assert_eq!(client_resolved.describe(), server_resolved.describe());
+    assert_eq!(client_resolved.transport.name(), "tagged");
+    assert!(
+        !client_resolved.fec.active(),
+        "FEC is inactive on both ends"
+    );
+    assert_eq!(client_resolved.congestion.name(), "none");
+    assert_eq!(
+        client_resolved.cipher.key_schedule(),
+        server_resolved.cipher.key_schedule()
+    );
+
+    // --- data flows through the tagged envelope with FEC and CC disabled ---
+    let (client_inject_tx, client_inject_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (client_capture_tx, client_capture_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (server_inject_tx, server_inject_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (server_capture_tx, server_capture_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+    let client_tun = Box::new(PipeTun {
+        name: "rustnies0".into(),
+        mtu: 1400,
+        inject_rx: Arc::new(Mutex::new(client_inject_rx)),
+        capture_tx: client_capture_tx,
+    });
+    let server_tun = Box::new(PipeTun {
+        name: "rustnies".into(),
+        mtu: 1400,
+        inject_rx: Arc::new(Mutex::new(server_inject_rx)),
+        capture_tx: server_capture_tx,
+    });
+
+    let mut client_tunnel = Tunnel::from_handshake(
+        client_tun,
+        client_sock.clone(),
+        established_client.peer,
+        Session::new(established_client.session_id, SessionRole::Initiator),
+        client_resolved,
+        ObfuscationStack::new(),
+        established_client.send_key,
+        established_client.recv_key,
+        established_client.send_dir,
+        established_client.recv_dir,
+        Arc::new(Mutex::new(Counters::new())),
+    )
+    .unwrap();
+    let mut server_tunnel = Tunnel::from_handshake(
+        server_tun,
+        server_sock.clone(),
+        established_server.peer,
+        Session::new(established_server.session_id, SessionRole::Responder),
+        server_resolved,
+        ObfuscationStack::new(),
+        established_server.send_key,
+        established_server.recv_key,
+        established_server.send_dir,
+        established_server.recv_dir,
+        Arc::new(Mutex::new(Counters::new())),
+    )
+    .unwrap();
+
+    // `max_m = 4` in the config, but the negotiated scheme is inactive, so the
+    // tunnel must collapse the parity budget to zero rather than emit parities
+    // the peer's decoder was not built for.
+    client_tunnel.configure_fec(&rustnies::config::FecConfig {
+        scheme: vec!["none".into()],
+        k: 1,
+        min_m: 0,
+        max_m: 4,
+        initial_m: 2,
+    });
+    server_tunnel.configure_fec(&rustnies::config::FecConfig {
+        scheme: vec!["none".into()],
+        ..Default::default()
+    });
+
+    client_tunnel.set_keepalive_params(Duration::from_secs(2), Duration::from_secs(20));
+    server_tunnel.set_keepalive_params(Duration::from_secs(2), Duration::from_secs(20));
+
+    let (client_udp_tx, client_udp_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1024);
+    tokio::spawn(socket_reader(client_sock.clone(), client_udp_tx));
+    let (server_udp_tx, server_udp_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1024);
+    tokio::spawn(socket_reader(server_sock.clone(), server_udp_tx));
+
+    let (client_stop_tx, client_stop_rx) = watch::channel(false);
+    let (server_stop_tx, server_stop_rx) = watch::channel(false);
+    let client_task =
+        tokio::spawn(async move { client_tunnel.run(client_stop_rx, client_udp_rx).await });
+    let server_task =
+        tokio::spawn(async move { server_tunnel.run(server_stop_rx, server_udp_rx).await });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Client -> server.
+    let want: Vec<Vec<u8>> = (0..5u8)
+        .map(|i| {
+            let mut p = vec![0xC0; 64];
+            p[0] = 0x45;
+            p[20] = i;
+            p
+        })
+        .collect();
+    for p in &want {
+        client_inject_tx.send(p.clone()).unwrap();
+    }
+    let mut got_rx = server_capture_rx;
+    let got = collect_packets(
+        &mut got_rx,
+        want.len(),
+        Duration::from_millis(500),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(
+        got, want,
+        "every packet survives the tagged envelope with FEC off"
+    );
+
+    // Server -> client, so the other direction is covered too.
+    let back: Vec<Vec<u8>> = (0..5u8)
+        .map(|i| {
+            let mut p = vec![0xB0; 96];
+            p[0] = 0x45;
+            p[20] = 0x80 + i;
+            p
+        })
+        .collect();
+    for p in &back {
+        server_inject_tx.send(p.clone()).unwrap();
+    }
+    let mut got_rx = client_capture_rx;
+    let got = collect_packets(
+        &mut got_rx,
+        back.len(),
+        Duration::from_millis(500),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(got, back, "the reverse direction works too");
+
+    let _ = client_stop_tx.send(true);
+    let _ = server_stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), client_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), server_task).await;
 }

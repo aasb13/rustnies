@@ -200,7 +200,23 @@ is handled by the FEC group logic and the AEAD tag).
   header borrow and an owned body without copying the header.
 
 A `Packet` value bundles a `PacketHeader` and a `bytes::Bytes` ciphertext body.
-`Packet::empty` builds a header-only control frame.
+`Packet::empty` and `split` are part of the codec's public surface but the
+production send/receive path uses `encode_raw` + `decode` (see
+`Tunnel::send_packet` / `handle_udp_datagram`); they exist for hot-path decoders
+that want a zero-copy body.
+
+Note the decoder deliberately does **not** validate the body against
+`header.packet_type` (no per-type length or content check). The size gates live
+one layer up, in the tunnel: `MAX_PAYLOAD` on the TUN read path and
+`PATH_MTU - OUTER_OVERHEAD` on the send path.
+
+## Modularity
+
+The wire format above is fixed. The *implementations* it is driven by — the
+cipher, the datagram envelope, the FEC erasure code, the congestion controller,
+the key exchange — are selected per session from config, and most of them are
+negotiated in the Noise handshake. That is a separate concern from this
+document: see [`profiles.md`](profiles.md).
 
 ## Session
 

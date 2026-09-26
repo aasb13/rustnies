@@ -25,9 +25,9 @@ use crate::config::{ClientConfig, ServerConfig, ServerFileConfig};
 use crate::crypto::keys::KeyPair;
 use crate::obfuscation;
 use crate::platform;
+use crate::protocol::profile::{LocalProfile, ResolvedProfile};
 use crate::protocol::session::{Session, SessionRole};
 use crate::stats::Counters;
-use crate::transport::default_transport;
 use crate::tun::TunFactory;
 use crate::tunnel::Tunnel;
 use crate::tunnel::TunnelExit;
@@ -314,6 +314,29 @@ pub async fn run_client(mut cfg: ClientConfig) -> std::io::Result<()> {
     let obfuscation_cfg = cfg.obfuscation.as_ref();
     let obf_stack = obfuscation::build_shared_stack(obfuscation_cfg);
 
+    // Resolve this side's protocol profile from config. Every configured part
+    // name is validated here, once, so a typo fails at startup with the
+    // offending string in the message rather than as a handshake timeout later.
+    let local_profile = match LocalProfile::from_role_config(
+        &cfg.handshake,
+        &cfg.crypto,
+        &cfg.transport,
+        &cfg.fec,
+        &cfg.congestion,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid [protocol] configuration: {e}"),
+            ));
+        }
+    };
+    tracing::info!(
+        profile = ?local_profile,
+        "client protocol profile resolved from config"
+    );
+
     // Reconnection loop. Each iteration binds a fresh ephemeral UDP socket,
     // runs the Noise IK handshake, drives one tunnel session to completion,
     // then — if reconnection is enabled — starts again. A failed handshake
@@ -366,7 +389,7 @@ pub async fn run_client(mut cfg: ClientConfig) -> std::io::Result<()> {
                 cfg.server,
                 &client_kp,
                 server_pub,
-                default_transport(),
+                &local_profile,
                 &obf_stack,
             ) => match res {
                 Ok(e) => e,
@@ -417,13 +440,34 @@ pub async fn run_client(mut cfg: ClientConfig) -> std::io::Result<()> {
         // session so the init does not leak across reconnects.
         let session_stack = (*obf_stack).clone();
         session_stack.init(&established.handshake_hash);
+
+        // Instantiate the profile the server selected. The client validates the
+        // selection during `client_finalize`, so a server running something this
+        // build cannot do already failed the handshake; reaching here means the
+        // two ends agree and can build identical profiles.
+        let resolved = match ResolvedProfile::with_handshake_transport(
+            &established.selection,
+            &established.handshake_hash,
+            &*local_profile.handshake_transport,
+            local_profile.new_congestion(),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("server selected an unusable protocol profile: {e}"),
+                ));
+            }
+        };
+        tracing::info!(profile = %resolved.describe(), "client session profile negotiated");
+
         let session = Session::new(established.session_id, SessionRole::Initiator);
         let mut tunnel = Tunnel::from_handshake(
             tun,
             sock.clone(),
             established.peer,
             session,
-            default_transport(),
+            resolved,
             session_stack,
             established.send_key,
             established.recv_key,
@@ -432,8 +476,9 @@ pub async fn run_client(mut cfg: ClientConfig) -> std::io::Result<()> {
             counters.clone(),
         )?;
 
-        // Apply FEC settings from the resolved config.
-        tunnel.configure_fec(cfg.fec.k, cfg.fec.min_m, cfg.fec.max_m, cfg.fec.initial_m);
+        // Apply FEC tuning from the resolved config. The erasure code itself came
+        // from the negotiated profile.
+        tunnel.configure_fec(&cfg.fec);
 
         // Feed the tunnel from a dedicated socket-reader task so the
         // steady-state loop can be identical to the server's channel-fed
@@ -633,6 +678,29 @@ pub async fn run_server(cfg: ServerConfig) -> std::io::Result<()> {
     // seeded from that client's handshake hash (see `server::handle_handshake`).
     let obf_stack = obfuscation::build_shared_stack(cfg.obfuscation.as_ref());
 
+    // Resolve the server's protocol profile from config. The server is
+    // authoritative: this ordering is what the selection in the handshake
+    // message-2 payload walks when a client proposes alternatives.
+    let local_profile = match LocalProfile::from_role_config(
+        &cfg.handshake,
+        &cfg.crypto,
+        &cfg.transport,
+        &cfg.fec,
+        &cfg.congestion,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid [protocol] configuration: {e}"),
+            ));
+        }
+    };
+    tracing::info!(
+        profile = ?local_profile,
+        "server protocol profile resolved from config"
+    );
+
     // The TUN subnet(s) the dispatcher trusts for tunnel-IP learning: only
     // inner source addresses inside these nets are registered as client
     // tunnel IPs (implausible sources are rejected with a warning instead of
@@ -661,7 +729,7 @@ pub async fn run_server(cfg: ServerConfig) -> std::io::Result<()> {
         sock,
         server_kp,
         tun,
-        default_transport(),
+        local_profile,
         obf_stack,
         stop_rx,
         stop_tx,

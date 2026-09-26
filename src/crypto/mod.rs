@@ -17,7 +17,9 @@
 pub mod aead;
 pub mod keys;
 pub mod noise;
+pub mod suite;
 
 pub use aead::{NonceBytes, decrypt, encrypt};
 pub use keys::{KeyPair, PublicKey, StaticSecret};
 pub use noise::{HandshakeResult, HandshakeRole, NoiseHandshake};
+pub use suite::{AeadCipher, CipherKind, DEFAULT_CIPHER, build_cipher, select_cipher};

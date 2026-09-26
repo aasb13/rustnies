@@ -99,14 +99,23 @@ pipeline and the raw UDP bytes, adding such a transport looks like:
 
 1. Implement `Transport` for a new type (e.g. `TlsFrontTransport`,
    `MimicryTransport`).
-2. Construct it wherever `default_transport()` is called today (the daemon's
-   client/server paths and the handshake driver).
+2. Add a `TRANSPORT_*` wire id plus `transport_id` / `transport_name` /
+   `build_transport` arms.
 3. Nothing else changes: the protocol header, AEAD, FEC, congestion, and TUN
    layers are oblivious to the on-the-wire shape.
 
-The `Transport` can also be selected at runtime (e.g. from config) since it is
-a `Box<dyn Transport>`; the daemon just needs to build the right one and pass
-it into the handshake and tunnel constructors.
+**Selection from config is already wired.** A transport is chosen by name from
+`[transport] handshake` (the handshake envelope, config-pinned on both peers)
+and `[transport] data` (the steady-state envelope, negotiated in the handshake).
+The daemon resolves both through `LocalProfile::from_role_config`; the tunnel
+receives the negotiated one inside its `ResolvedProfile`. See
+[`profiles.md`](profiles.md).
+
+`Transport` also gained an `init(&[u8; 32])` hook, mirroring
+`ObfuscationLayer::init`, so a keyed transport can derive the same material on
+both peers from the handshake hash. It is **not** called for the handshake
+envelope, which is encoded before any session hash exists — that is why
+handshake transports must be unkeyed.
 
 ## Relationship to the `ObfuscationLayer` stack
 

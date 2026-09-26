@@ -27,6 +27,12 @@ pub enum FecError {
     Insufficient { have: usize, need: usize },
     #[error("decode linear system was singular")]
     Singular,
+    /// The active [`super::FecScheme`] cannot produce parity at all (e.g.
+    /// `scheme = "none"`). Reaching this means a caller invoked the code
+    /// despite parity being disabled, which is a bug rather than a runtime
+    /// condition.
+    #[error("fec scheme is disabled; no parity is produced")]
+    Inactive,
 }
 
 /// A Reed-Solomon (k, m) configuration plus its systematic generator matrix.

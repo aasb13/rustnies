@@ -6,6 +6,25 @@ down with measured packet loss. All FEC logic lives in `src/fec/` and is
 decoupled from the protocol, crypto, and transport layers: FEC only knows about
 groups of symbols and their indices.
 
+## The seam: code vs. parameters
+
+Two independent things are often conflated here, and `rustnies` keeps them
+separate on purpose:
+
+- **Which erasure code** — the `FecScheme` trait (`src/fec/mod.rs`), selected by
+  `[fec] scheme`. This is **negotiated** in the handshake, because a mismatched
+  code would corrupt groups rather than fail cleanly. `reed-solomon` (the
+  default) and `none` are implemented; `none` reports itself inactive, which
+  pins the controller's `max_m` to zero so no parity is encoded, sent, buffered
+  or decoded, and so a stale `max_m` in the config cannot resurrect parity
+  against the session's negotiated wishes.
+- **How much parity** — `k` / `min_m` / `max_m` / `initial_m` in `[fec]`, owned
+  by `AdaptiveFec`. This is a **local sender policy**: both ends read `k` and `m`
+  off every packet header, so there is nothing to negotiate, only to obey.
+
+The split is what lets a deployment turn FEC off entirely, or move to a different
+code, without touching the loss-feedback loop. See [`profiles.md`](profiles.md).
+
 ## Why Reed-Solomon
 
 Reed-Solomon over GF(256) is an MDS (maximum distance separable) erasure code:

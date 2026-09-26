@@ -6,6 +6,24 @@
 
 use super::{PacketType, SessionId};
 
+/// Derive the 32-bit session id from a Noise handshake hash.
+///
+/// The first four hash bytes are folded big-endian into a `u32`. `0` is
+/// reserved as "no session" throughout the protocol (a header with session id
+/// 0 is never accepted, and the AEAD nonce reserves it), so a hash that would
+/// produce `0` is forced to `1`.
+///
+/// This lives here rather than in the tunnel layer because it is pure session
+/// identity: both the handshake (which produces the hash) and the AEAD nonce
+/// construction depend on it, and neither should have to reach into `tunnel`.
+pub fn session_id_from_hash(h: &[u8; 32]) -> SessionId {
+    let mut id = 0u32;
+    for &b in &h[..4] {
+        id = (id << 8) | b as u32;
+    }
+    if id == 0 { 1 } else { id }
+}
+
 /// Which side of the handshake this session plays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionRole {

@@ -22,17 +22,15 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc, watch};
 
-use crate::congestion::CongestionController;
-use crate::crypto::aead::{self, Direction};
+use crate::crypto::aead::Direction;
 use crate::fec::adaptive::{AdaptiveFec, FecParams};
-use crate::fec::reed_solomon::ReedSolomon;
 use crate::obfuscation::{ObfuscationStack, is_decoy_frame};
 use crate::protocol::SessionId;
 use crate::protocol::codec;
 use crate::protocol::header::{MAX_PAYLOAD, OUTER_OVERHEAD, PATH_MTU, PacketHeader, PacketType};
+use crate::protocol::profile::ResolvedProfile;
 use crate::protocol::session::Session;
 use crate::stats::Counters;
-use crate::transport::Transport;
 
 /// Time after which an incomplete RX FEC group is evicted (memory bound).
 const RX_GROUP_TTL: Duration = Duration::from_secs(5);
@@ -181,8 +179,12 @@ pub struct Tunnel {
     pub sock: Arc<UdpSocket>,
     pub peer: SocketAddr,
     pub session: Session,
-    pub transport: Box<dyn Transport>,
-    /// Stackable obfuscation transforms applied on top of `transport`. When
+    /// The negotiated protocol profile: the per-packet cipher, the steady-state
+    /// envelope, the erasure code and the local rate limiter. One field rather
+    /// than four so it is impossible to build a tunnel that mixes, say, one
+    /// party's cipher with another party's envelope.
+    pub profile: ResolvedProfile,
+    /// Stackable obfuscation transforms applied on top of `profile.transport`. When
     /// empty (the default), this is an identity and the hot path is
     /// allocation-free. When non-empty, `apply` runs before `Transport::wrap`
     /// on send and `reverse` runs after `Transport::unwrap` on receive.
@@ -194,12 +196,10 @@ pub struct Tunnel {
 
     fec: AdaptiveFec,
     fec_params: FecParams,
-    rs: ReedSolomon,
     group_id: u16,
     group_index: u8,
     group_buffer: Vec<Vec<u8>>,
 
-    cc: CongestionController,
     outstanding: Vec<Outstanding>,
 
     // Ping bookkeeping.
@@ -284,7 +284,7 @@ impl Tunnel {
         sock: Arc<UdpSocket>,
         peer: SocketAddr,
         session: Session,
-        transport: Box<dyn Transport>,
+        profile: ResolvedProfile,
         obfuscation: ObfuscationStack,
         send_key: [u8; 32],
         recv_key: [u8; 32],
@@ -300,14 +300,12 @@ impl Tunnel {
         // initial_m so the first packets carry burst protection, and let the
         // EMA earn its way down to min_m once real (zero) loss samples arrive.
         let params = fec.params();
-        let rs = ReedSolomon::new(params.k as usize, params.m as usize)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         Ok(Self {
             tun,
             sock,
             peer,
             session,
-            transport,
+            profile,
             obfuscation,
             send_key,
             recv_key,
@@ -315,11 +313,9 @@ impl Tunnel {
             recv_dir,
             fec,
             fec_params: params,
-            rs,
             group_id: 0,
             group_index: 0,
             group_buffer: Vec::with_capacity(params.k as usize),
-            cc: CongestionController::new(),
             outstanding: Vec::new(),
             ping_seq: 0,
             last_ping_sent: None,
@@ -365,26 +361,45 @@ impl Tunnel {
         self.evict_rx = Some(rx);
     }
 
-    /// Apply FEC parameters from the resolved config. Called by the daemon
-    /// after [`Tunnel::from_handshake`] to override the default FEC settings.
-    /// Falls back to [`AdaptiveFec::default_for_vpn`] if the custom parameters
-    /// are invalid (e.g. `k + m > 255`).
-    pub fn configure_fec(&mut self, k: u8, min_m: u8, max_m: u8, initial_m: u8) {
+    /// Apply FEC tuning parameters from the resolved config. Called by the
+    /// daemon after [`Tunnel::from_handshake`] to override the defaults.
+    ///
+    /// The erasure *code* is not set here: it was already negotiated and
+    /// instantiated into [`Tunnel::profile`]. What this sets is how much parity
+    /// to send, which is a purely local sender policy. An inactive scheme (e.g.
+    /// `scheme = "none"`) pins `max_m` to zero regardless of the config, so a
+    /// `max_m` left over in the config cannot resurrect parity against the
+    /// session's negotiated wishes.
+    ///
+    /// Invalid parameters (e.g. `k + m > 255`) fall back to
+    /// [`AdaptiveFec::default_for_vpn`], or to zero parity when the scheme is
+    /// inactive.
+    pub fn configure_fec(&mut self, cfg: &crate::config::FecConfig) {
+        let active = self.profile.fec.active();
+        let k = cfg.k;
+        let min_m = if active { cfg.min_m } else { 0 };
+        let max_m = if active { cfg.max_m } else { 0 };
+        let initial_m = if active { cfg.initial_m } else { 0 };
         self.fec = AdaptiveFec::with_params(k, min_m, max_m, initial_m, 0.25);
         // Start at the configured initial_m (burst protection on the first
         // packets) rather than immediately relaxing to the floor.
         self.fec_params = self.fec.params();
-        match ReedSolomon::new(self.fec_params.k as usize, self.fec_params.m as usize) {
-            Ok(r) => self.rs = r,
-            Err(e) => {
-                tracing::warn!(?e, "invalid FEC config; falling back to defaults");
-                self.fec = AdaptiveFec::default_for_vpn();
-                self.fec_params = self.fec.params();
-                self.rs = ReedSolomon::new(self.fec_params.k as usize, self.fec_params.m as usize)
-                    .expect("default FEC params must be valid");
-            }
+        if !active {
+            // Nothing to encode, so collapse every group's parity budget.
+            self.fec_params.m = 0;
+        } else if self.fec_params.k == 0
+            || self.fec_params.k as usize + self.fec_params.m as usize > 255
+        {
+            tracing::warn!(
+                k = self.fec.k,
+                max_m = self.fec.max_m,
+                "invalid FEC config; falling back to defaults"
+            );
+            self.fec = AdaptiveFec::default_for_vpn();
+            self.fec_params = self.fec.params();
         }
         tracing::info!(
+            scheme = self.profile.fec.name(),
             k = self.fec.k,
             min_m = self.fec.min_m,
             max_m = self.fec.max_m,
@@ -400,9 +415,9 @@ impl Tunnel {
     fn wrap_frame(&self, frame: &[u8]) -> Vec<u8> {
         if self.obfuscation.active() {
             let obf = self.obfuscation.apply(frame);
-            self.transport.wrap(&obf)
+            self.profile.transport.wrap(&obf)
         } else {
-            self.transport.wrap(frame)
+            self.profile.transport.wrap(frame)
         }
     }
 
@@ -411,6 +426,7 @@ impl Tunnel {
     /// `wire -> transport.unwrap -> stack.reverse -> frame`.
     fn unwrap_frame(&self, datagram: &[u8]) -> Result<Vec<u8>, io::Error> {
         let inner = self
+            .profile
             .transport
             .unwrap(datagram)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -464,7 +480,7 @@ impl Tunnel {
         // the packet-count figures in stats). Falls back to the compiled-in
         // default when the platform cannot report one.
         if let Ok(mtu) = self.tun.mtu() {
-            self.cc.set_mtu(mtu);
+            self.profile.congestion.set_mtu(mtu);
         }
 
         {
@@ -666,7 +682,7 @@ impl Tunnel {
     /// and retried, and only superseded if the device produces another packet
     /// in the meantime (drop-oldest, so the queue never grows past one).
     fn park_if_paced(&mut self, packet: Vec<u8>) {
-        if let Some(deadline) = self.cc.next_send_deadline() {
+        if let Some(deadline) = self.profile.congestion.next_send_deadline() {
             // Drop-oldest: the queue is bounded at one packet, so a pacer that
             // is persistently behind cannot turn into unbounded latency.
             self.pending_out = Some(packet);
@@ -727,20 +743,20 @@ impl Tunnel {
         // on the mix of pings and full-size payloads, which made the drop
         // decision meaningless and let bursts through unpaced.
         let len = packet.len().max(1);
-        if self.cc.send_budget() < len as u64 {
+        if self.profile.congestion.send_budget() < len as u64 {
             tracing::trace!("congestion window full; dropping tun packet");
             let mut c = self.counters.lock().await;
             c.tx_dropped_congestion = c.tx_dropped_congestion.saturating_add(1);
             return false;
         }
-        if !self.cc.may_send(len) {
+        if !self.profile.congestion.may_send(len) {
             // Pacer says "not yet": the packet is delayed, not dropped.
             tracing::trace!("pacer holding tun packet; re-queueing");
             let mut c = self.counters.lock().await;
             c.tx_paced = c.tx_paced.saturating_add(1);
             return false;
         }
-        self.cc.on_send_bytes(len);
+        self.profile.congestion.on_send_bytes(len);
 
         let seq = self.session.alloc_seq();
         let (ack_seq, ack_bitmap) = self.session.ack_snapshot();
@@ -757,13 +773,20 @@ impl Tunnel {
         hdr.fec_m = m;
 
         // Encrypt: AAD = the 24-byte header, plaintext = the TUN packet.
-        let nonce = aead::make_nonce(self.session.id, seq, self.send_dir);
+        let nonce = self
+            .profile
+            .cipher
+            .make_nonce(self.session.id, seq, self.send_dir);
         let hdr_bytes = hdr.to_bytes();
-        let ciphertext = match aead::encrypt(&self.send_key, &nonce, &hdr_bytes, &packet) {
+        let ciphertext = match self
+            .profile
+            .cipher
+            .seal(&self.send_key, &nonce, &hdr_bytes, &packet)
+        {
             Ok(ct) => ct,
             Err(e) => {
                 tracing::error!(error = ?e, seq, "data encrypt failed; dropping packet");
-                self.cc.refund_send_bytes(len as u64);
+                self.profile.congestion.refund_send_bytes(len as u64);
                 return false;
             }
         };
@@ -782,12 +805,12 @@ impl Tunnel {
             );
             let mut c = self.counters.lock().await;
             c.tx_dropped_mtu = c.tx_dropped_mtu.saturating_add(1);
-            self.cc.refund_send_bytes(len as u64);
+            self.profile.congestion.refund_send_bytes(len as u64);
             return false;
         }
         if let Err(e) = self.sock.send_to(&wire, self.peer).await {
             tracing::warn!(error = ?e, seq, peer = %self.peer, "udp send failed; dropping tun packet");
-            self.cc.refund_send_bytes(len as u64);
+            self.profile.congestion.refund_send_bytes(len as u64);
             return false;
         }
         self.sent_packets.insert(
@@ -855,7 +878,7 @@ impl Tunnel {
         while sources.len() < k {
             sources.push(vec![0u8; len]);
         }
-        match self.rs.encode(&sources) {
+        match self.profile.fec.encode(k, m, &sources) {
             Ok(parities) => {
                 for (i, parity) in parities.into_iter().enumerate() {
                     // Parity is bulk wire traffic like data: it must consume
@@ -868,7 +891,7 @@ impl Tunnel {
                     // credit is consumed without refusal so FEC is not
                     // disabled exactly when the path is busy.
                     let plen = parity.len().max(1);
-                    if !self.cc.try_send_parity(plen) {
+                    if !self.profile.congestion.try_send_parity(plen) {
                         tracing::trace!("congestion window full; skipping fec parity");
                         let mut c = self.counters.lock().await;
                         c.tx_dropped_congestion = c.tx_dropped_congestion.saturating_add(1);
@@ -883,16 +906,24 @@ impl Tunnel {
                     hdr.fec_index = (k as u8) + i as u8;
                     hdr.fec_k = self.fec_params.k;
                     hdr.fec_m = self.fec_params.m;
-                    let nonce = aead::make_nonce(self.session.id, seq, self.send_dir);
+                    let nonce = self
+                        .profile
+                        .cipher
+                        .make_nonce(self.session.id, seq, self.send_dir);
                     let hdr_bytes = hdr.to_bytes();
-                    let ct = match aead::encrypt(&self.send_key, &nonce, &hdr_bytes, &parity) {
-                        Ok(ct) => ct,
-                        Err(e) => {
-                            tracing::error!(error = ?e, seq, "parity encrypt failed; skipping");
-                            self.cc.refund_send_bytes(plen as u64);
-                            continue;
-                        }
-                    };
+                    let ct =
+                        match self
+                            .profile
+                            .cipher
+                            .seal(&self.send_key, &nonce, &hdr_bytes, &parity)
+                        {
+                            Ok(ct) => ct,
+                            Err(e) => {
+                                tracing::error!(error = ?e, seq, "parity encrypt failed; skipping");
+                                self.profile.congestion.refund_send_bytes(plen as u64);
+                                continue;
+                            }
+                        };
                     let frame = codec::encode_raw(&hdr, &ct);
                     let wire = self.wrap_frame(&frame);
                     if wire.len() + OUTER_OVERHEAD > PATH_MTU {
@@ -903,7 +934,7 @@ impl Tunnel {
                         );
                         let mut c = self.counters.lock().await;
                         c.tx_dropped_mtu = c.tx_dropped_mtu.saturating_add(1);
-                        self.cc.refund_send_bytes(plen as u64);
+                        self.profile.congestion.refund_send_bytes(plen as u64);
                         continue;
                     }
                     if let Err(e) = self.sock.send_to(&wire, self.peer).await {
@@ -911,7 +942,7 @@ impl Tunnel {
                             error = ?e, seq, peer = %self.peer,
                             "fec parity udp send failed; parity datagram lost"
                         );
-                        self.cc.refund_send_bytes(plen as u64);
+                        self.profile.congestion.refund_send_bytes(plen as u64);
                         continue;
                     }
                     self.sent_packets.insert(
@@ -987,9 +1018,16 @@ impl Tunnel {
         let mut hdr = PacketHeader::new(ptype, self.session.id, seq);
         hdr.ack_seq = ack_seq;
         hdr.ack_bitmap = ack_bitmap;
-        let nonce = aead::make_nonce(self.session.id, seq, self.send_dir);
+        let nonce = self
+            .profile
+            .cipher
+            .make_nonce(self.session.id, seq, self.send_dir);
         let hdr_bytes = hdr.to_bytes();
-        let ct = match aead::encrypt(&self.send_key, &nonce, &hdr_bytes, payload) {
+        let ct = match self
+            .profile
+            .cipher
+            .seal(&self.send_key, &nonce, &hdr_bytes, payload)
+        {
             Ok(ct) => ct,
             Err(e) => {
                 tracing::error!(error = ?e, seq, "control encrypt failed; dropping packet");
@@ -1019,12 +1057,19 @@ impl Tunnel {
         let mut hdr = PacketHeader::new(ptype, self.session.id, seq);
         hdr.ack_seq = ack_seq;
         hdr.ack_bitmap = ack_bitmap;
-        let nonce = aead::make_nonce(self.session.id, seq, self.send_dir);
+        let nonce = self
+            .profile
+            .cipher
+            .make_nonce(self.session.id, seq, self.send_dir);
         let hdr_bytes = hdr.to_bytes();
-        let ct = aead::encrypt(&self.send_key, &nonce, &hdr_bytes, payload).map_err(|e| {
-            tracing::error!(error = ?e, seq, "reliable control encrypt failed");
-            io::Error::new(io::ErrorKind::Other, e.to_string())
-        })?;
+        let ct = self
+            .profile
+            .cipher
+            .seal(&self.send_key, &nonce, &hdr_bytes, payload)
+            .map_err(|e| {
+                tracing::error!(error = ?e, seq, "reliable control encrypt failed");
+                io::Error::new(io::ErrorKind::Other, e.to_string())
+            })?;
         let frame = codec::encode_raw(&hdr, &ct);
         let wire = self.wrap_frame(&frame);
         self.sock.send_to(&wire, self.peer).await?;
@@ -1058,7 +1103,12 @@ impl Tunnel {
         let mut resolved = Vec::new();
 
         let now = Instant::now();
-        let expiry = self.cc.rto().max(MIN_SENT_PACKET_LIFETIME);
+        let expiry = self
+            .profile
+            .congestion
+            .snapshot()
+            .rto
+            .max(MIN_SENT_PACKET_LIFETIME);
         for (seq, sent) in &self.sent_packets {
             if self.session.peer_acked(*seq) {
                 acked_bytes = acked_bytes.saturating_add(sent.bytes);
@@ -1088,18 +1138,18 @@ impl Tunnel {
             });
             rtt_sampled = rtt.is_some();
             match rtt {
-                Some(rtt) => self.cc.on_ack_with_rtt(acked_bytes, rtt),
-                None => self.cc.on_ack_bytes(acked_bytes),
+                Some(rtt) => self.profile.congestion.on_ack_with_rtt(acked_bytes, rtt),
+                None => self.profile.congestion.on_ack_bytes(acked_bytes),
             }
         }
         if lost_bytes > 0 {
-            self.cc.release(lost_bytes);
+            self.profile.congestion.release(lost_bytes);
         }
 
         for (_, acked, sent) in resolved {
             let lost = !acked;
             if let Some((lost, total)) = self.wire_loss_window.record(lost, LOSS_SAMPLE_PACKETS) {
-                self.cc.on_loss(lost, total);
+                self.profile.congestion.on_loss(lost, total);
             }
 
             if sent.kind == SentPacketKind::Data
@@ -1116,7 +1166,7 @@ impl Tunnel {
     /// Retransmit unacked control packets whose RTO has elapsed.
     async fn check_retransmits(&mut self) {
         self.reconcile_peer_acks();
-        let rto = self.cc.rto();
+        let rto = self.profile.congestion.snapshot().rto;
         let mut to_resend: Vec<usize> = Vec::new();
         for (i, o) in self.outstanding.iter().enumerate() {
             if o.last_sent.elapsed() >= rto {
@@ -1170,15 +1220,23 @@ impl Tunnel {
         );
 
         // Decrypt.
-        let nonce = aead::make_nonce(self.session.id, hdr.seq, self.recv_dir);
+        let nonce = self
+            .profile
+            .cipher
+            .make_nonce(self.session.id, hdr.seq, self.recv_dir);
         let hdr_bytes = hdr.to_bytes();
-        let plaintext = match aead::decrypt(&self.recv_key, &nonce, &hdr_bytes, &pkt.body) {
-            Ok(p) => p,
-            Err(_) => {
-                tracing::debug!(seq = hdr.seq, "decrypt failed; dropping");
-                return Ok(());
-            }
-        };
+        let plaintext =
+            match self
+                .profile
+                .cipher
+                .open(&self.recv_key, &nonce, &hdr_bytes, &pkt.body)
+            {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::debug!(seq = hdr.seq, "decrypt failed; dropping");
+                    return Ok(());
+                }
+            };
 
         if hdr.ack_seq != self.last_peer_ack || hdr.ack_bitmap != self.last_peer_bitmap {
             self.session.observe_acks(hdr.ack_seq, hdr.ack_bitmap);
@@ -1411,17 +1469,14 @@ impl Tunnel {
         // delivery state (which slots were already written to TUN directly).
         let symbols: Vec<Option<Vec<u8>>> = entry.symbols.clone();
         let pre_delivered: Vec<bool> = entry.delivered.clone();
-        let rs = match ReedSolomon::new(k, m) {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-        let recovered = match rs.decode(&symbols) {
+        let recovered = match self.profile.fec.decode(k, m, &symbols) {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!(
                     ?e,
                     group,
-                    "rs decode failed (expected if k already complete)"
+                    scheme = self.profile.fec.name(),
+                    "fec decode failed (expected if k already complete)"
                 );
                 return;
             }
@@ -1469,13 +1524,6 @@ impl Tunnel {
                 "FEC parameters updated"
             );
             self.fec_params = params;
-            self.rs = match ReedSolomon::new(params.k as usize, params.m as usize) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(?e, "invalid FEC params; keeping old");
-                    return;
-                }
-            };
         }
     }
 
@@ -1504,11 +1552,12 @@ impl Tunnel {
             .as_micros() as u64;
         if now_micros >= ts_micros {
             let rtt = Duration::from_micros(now_micros - ts_micros);
-            self.cc.on_rtt_sample(rtt);
+            self.profile.congestion.on_rtt_sample(rtt);
+            let snap = self.profile.congestion.snapshot();
             let mut c = self.counters.lock().await;
             c.rtt_ms = rtt.as_secs_f64() * 1000.0;
-            c.congestion_window = self.cc.cwnd as f64;
-            c.in_flight = self.cc.in_flight;
+            c.congestion_window = snap.cwnd as f64;
+            c.in_flight = snap.in_flight;
         }
     }
 
@@ -1522,19 +1571,11 @@ impl Tunnel {
         c.fec_k = self.fec_params.k;
         c.fec_m = self.fec_params.m;
         c.loss_rate = self.fec.smoothed_loss;
-        c.congestion_window = self.cc.cwnd as f64;
-        c.in_flight = self.cc.in_flight;
-        c.pacing_rate = self.cc.pacing_rate;
+        let snap = self.profile.congestion.snapshot();
+        c.congestion_window = snap.cwnd as f64;
+        c.in_flight = snap.in_flight;
+        c.pacing_rate = snap.pacing_rate;
     }
-}
-
-/// Convenience: derive a 32-bit session id from a Noise handshake hash.
-pub fn session_id_from_hash(h: &[u8; 32]) -> SessionId {
-    let mut id = 0u32;
-    for &b in &h[..4] {
-        id = (id << 8) | b as u32;
-    }
-    if id == 0 { 1 } else { id }
 }
 
 /// Adapter for the eviction signal in the `Tunnel::run` select loop.
@@ -1552,9 +1593,12 @@ async fn evict_recv(rx: &mut Option<mpsc::UnboundedReceiver<()>>) -> Option<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::congestion::{CongestionKind, MIN_CWND_BYTES};
     use crate::crypto::aead::Direction;
+    use crate::crypto::suite::AeadCipher;
+    use crate::fec::{ReedSolomon, ReedSolomonScheme};
+    use crate::protocol::profile::Selection;
     use crate::protocol::session::{Session, SessionRole};
-    use crate::transport::default_transport;
     use crate::tun::{Tun, TunFut};
     use std::sync::Mutex as StdMutex;
     use tokio::net::UdpSocket;
@@ -1598,7 +1642,7 @@ mod tests {
             sock,
             "127.0.0.1:1".parse().unwrap(),
             session,
-            default_transport(),
+            test_profile(&Selection::defaults()),
             crate::obfuscation::ObfuscationStack::new(),
             [0u8; 32],
             [0u8; 32],
@@ -1607,6 +1651,29 @@ mod tests {
             counters,
         )
         .unwrap()
+    }
+
+    /// A resolved profile with the default parts, built the same way the daemon
+    /// builds one. Tests that need a different FEC scheme or cipher use
+    /// `test_profile_with`.
+    fn test_profile(selection: &Selection) -> ResolvedProfile {
+        test_profile_with(selection, crate::congestion::DEFAULT_CONGESTION)
+    }
+
+    fn test_profile_with(selection: &Selection, congestion: &str) -> ResolvedProfile {
+        let kind = match congestion {
+            "none" => CongestionKind::None,
+            _ => CongestionKind::TcpReno,
+        };
+        // The default selection reuses the handshake envelope, so it has to go
+        // through `with_handshake_transport` — exactly as the daemon does.
+        ResolvedProfile::with_handshake_transport(
+            selection,
+            &[0u8; 32],
+            &crate::transport::PlainTransport,
+            kind.build(),
+        )
+        .expect("default selection is always instantiable")
     }
 
     fn data_hdr(group: u16, index: u8, k: u8, m: u8) -> PacketHeader {
@@ -1641,8 +1708,11 @@ mod tests {
         let mut hdr = PacketHeader::new(ptype, 0xCAFEBABE, seq);
         hdr.ack_seq = ack_seq;
         hdr.ack_bitmap = ack_bitmap;
-        let nonce = aead::make_nonce(0xCAFEBABE, seq, Direction::ResponderToInitiator);
-        let ct = aead::encrypt(&[0u8; 32], &nonce, &hdr.to_bytes(), payload).unwrap();
+        let cipher = crate::crypto::suite::ChaCha20Poly1305Cipher;
+        let nonce = cipher.make_nonce(0xCAFEBABE, seq, Direction::ResponderToInitiator);
+        let ct = cipher
+            .seal(&[0u8; 32], &nonce, &hdr.to_bytes(), payload)
+            .unwrap();
         codec::encode_raw(&hdr, &ct).to_vec()
     }
 
@@ -1677,7 +1747,7 @@ mod tests {
     }
 
     fn record_sent(t: &mut Tunnel, seq: u32, bytes: u64, kind: SentPacketKind) {
-        t.cc.on_send_bytes(bytes as usize);
+        t.profile.congestion.on_send_bytes(bytes as usize);
         t.sent_packets.insert(
             seq,
             SentPacket {
@@ -1695,7 +1765,7 @@ mod tests {
         record_sent(&mut t, 1, 100, SentPacketKind::Data);
         record_sent(&mut t, 2, 200, SentPacketKind::Parity);
         record_sent(&mut t, 3, 300, SentPacketKind::Data);
-        let cwnd_before = t.cc.cwnd;
+        let cwnd_before = t.profile.congestion.snapshot().cwnd;
 
         t.handle_udp_datagram(
             &peer_frame(PacketType::Keepalive, 1, 2, 0b01, b""),
@@ -1704,8 +1774,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(t.cc.in_flight, 300);
-        assert_eq!(t.cc.cwnd, cwnd_before + 300);
+        assert_eq!(t.profile.congestion.snapshot().in_flight, 300);
+        assert_eq!(t.profile.congestion.snapshot().cwnd, cwnd_before + 300);
         assert_eq!(t.sent_packets.len(), 1);
     }
 
@@ -1723,7 +1793,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(t.cc.in_flight, 100);
+        assert_eq!(t.profile.congestion.snapshot().in_flight, 100);
         assert!(t.sent_packets.contains_key(&1));
 
         t.handle_udp_datagram(
@@ -1732,7 +1802,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(t.cc.in_flight, 0);
+        assert_eq!(t.profile.congestion.snapshot().in_flight, 0);
         assert!(t.sent_packets.is_empty());
         assert_eq!(t.wire_loss_window.lost, 1);
         assert_eq!(t.source_loss_window.lost, 1);
@@ -1747,7 +1817,7 @@ mod tests {
 
         t.reconcile_peer_acks();
 
-        assert_eq!(t.cc.in_flight, 0);
+        assert_eq!(t.profile.congestion.snapshot().in_flight, 0);
         assert!(t.sent_packets.is_empty());
         assert_eq!(t.wire_loss_window.lost, 1);
         assert_eq!(t.source_loss_window.lost, 1);
@@ -1761,23 +1831,22 @@ mod tests {
         for seq in 35..=97 {
             record_sent(&mut t, seq, 100, SentPacketKind::Data);
         }
-        t.cc.cwnd = 1_000_000;
-        t.cc.ssthresh = 0;
-        let cwnd_before = t.cc.cwnd;
+        t.profile.congestion.set_cwnd(1_000_000);
+        let cwnd_before = t.profile.congestion.snapshot().cwnd;
 
         t.session.observe_acks(66, u32::MAX);
         t.reconcile_peer_acks();
         assert_eq!(t.sent_packets.len(), 31);
         assert!(t.sent_packets.contains_key(&67));
-        assert_eq!(t.cc.last_loss, 0.0);
+        assert_eq!(t.profile.congestion.snapshot().last_loss, 0.0);
 
         t.session.observe_acks(97, 0x7FFF_FFFF);
         t.reconcile_peer_acks();
         assert!(t.sent_packets.is_empty());
-        assert_eq!(t.cc.last_loss, 1.0 / 64.0);
+        assert_eq!(t.profile.congestion.snapshot().last_loss, 1.0 / 64.0);
         assert_eq!(t.fec.smoothed_loss, 1.0 / 256.0);
         assert_eq!(t.fec_params.m, 0);
-        assert!(t.cc.cwnd < cwnd_before);
+        assert!(t.profile.congestion.snapshot().cwnd < cwnd_before);
     }
 
     #[test]
@@ -1799,8 +1868,8 @@ mod tests {
         let sent = Arc::new(StdMutex::new(Vec::new()));
         let mut t = build_tunnel(sent.clone()).await;
         record_sent(&mut t, 1, 100, SentPacketKind::Data);
-        let in_flight = t.cc.in_flight;
-        let cwnd = t.cc.cwnd;
+        let in_flight = t.profile.congestion.snapshot().in_flight;
+        let cwnd = t.profile.congestion.snapshot().cwnd;
         let mut frame = peer_frame(PacketType::Keepalive, 1, 40, 0, b"");
         let last = frame.len() - 1;
         frame[last] ^= 1;
@@ -1810,8 +1879,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(t.session.peer_ack, 0);
-        assert_eq!(t.cc.in_flight, in_flight);
-        assert_eq!(t.cc.cwnd, cwnd);
+        assert_eq!(t.profile.congestion.snapshot().in_flight, in_flight);
+        assert_eq!(t.profile.congestion.snapshot().cwnd, cwnd);
         assert_eq!(t.sent_packets.len(), 1);
     }
 
@@ -1824,10 +1893,10 @@ mod tests {
         let mut t = build_tunnel(sent.clone()).await;
         // Exhaust the byte window: send until there is no budget left, with no
         // acks to reopen it.
-        while t.cc.send_budget() > 0 {
-            t.cc.on_send();
+        while t.profile.congestion.send_budget() > 0 {
+            t.profile.congestion.on_send_bytes(1300);
         }
-        assert_eq!(t.cc.send_budget(), 0);
+        assert_eq!(t.profile.congestion.send_budget(), 0);
         let tx_before = t.counters.lock().await.tx_packets;
         t.handle_tun_packet(vec![0xAA; 32]).await;
         let c = t.counters.lock().await;
@@ -1836,7 +1905,11 @@ mod tests {
             "dropped packet is not counted as sent"
         );
         assert_eq!(c.tx_dropped_congestion, 1, "drop is observable in stats");
-        assert_eq!(t.cc.in_flight, t.cc.cwnd, "dropped packet reserves no slot");
+        assert_eq!(
+            t.profile.congestion.snapshot().in_flight,
+            t.profile.congestion.snapshot().cwnd,
+            "dropped packet reserves no slot"
+        );
     }
 
     #[tokio::test]
@@ -1954,7 +2027,7 @@ mod tests {
         let mut t = build_tunnel(sent).await;
         // Force FEC on with k=4, m=2.
         t.fec_params = FecParams { k: 4, m: 2 };
-        t.rs = ReedSolomon::new(4, 2).unwrap();
+        t.profile.fec = Box::new(ReedSolomonScheme);
         // Recv socket to capture sends.
         let rx_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let rx_addr = rx_sock.local_addr().unwrap();
@@ -1997,7 +2070,7 @@ mod tests {
         let sent = Arc::new(StdMutex::new(Vec::new()));
         let mut t = build_tunnel(sent).await;
         t.fec_params = FecParams { k: 1, m: 3 };
-        t.rs = ReedSolomon::new(1, 3).unwrap();
+        t.profile.fec = Box::new(ReedSolomonScheme);
         let rx_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let rx_addr = rx_sock.local_addr().unwrap();
         let (rx_tx, mut rx_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -2033,7 +2106,7 @@ mod tests {
         let sent = Arc::new(StdMutex::new(Vec::new()));
         let mut t = build_tunnel(sent).await;
         t.fec_params = FecParams { k: 1, m: 3 };
-        t.rs = ReedSolomon::new(1, 3).unwrap();
+        t.profile.fec = Box::new(ReedSolomonScheme);
         let rx_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let rx_addr = rx_sock.local_addr().unwrap();
         let (rx_tx, mut rx_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -2049,13 +2122,23 @@ mod tests {
             }
         });
         t.peer = rx_addr;
-        // Leave exactly one data packet of budget: the 32-byte data fits, but
-        // after it is admitted the three 32-byte parities do not.
-        t.cc.cwnd = 48;
-        t.cc.in_flight = 0;
-        assert_eq!(t.cc.send_budget(), 48);
+        // Leave room for exactly one maximum-size data packet and nothing more,
+        // so the three same-size parities are all refused. `set_cwnd` clamps to
+        // the controller's floor (two full-size datagrams), so the packet is
+        // sized to fill that window instead of shrinking the window below it.
+        t.profile.congestion.set_cwnd(MIN_CWND_BYTES);
+        let payload = vec![0xAA; MAX_PAYLOAD];
+        assert_eq!(
+            t.profile.congestion.send_budget(),
+            MIN_CWND_BYTES,
+            "window starts empty"
+        );
+        assert!(
+            MIN_CWND_BYTES - (MAX_PAYLOAD as u64) < MAX_PAYLOAD as u64,
+            "the remainder after one packet cannot fit another"
+        );
         let dropped_before = t.counters.lock().await.tx_dropped_congestion;
-        t.handle_tun_packet(vec![0xAA; 32]).await;
+        t.handle_tun_packet(payload).await;
         tokio::time::sleep(Duration::from_millis(30)).await;
         let mut count = 0;
         while rx_rx.try_recv().is_ok() {
@@ -2081,7 +2164,7 @@ mod tests {
         let sources: Vec<Vec<u8>> = (0..k).map(|i| vec![10 * (i + 1)]).collect();
         let rs = ReedSolomon::new(k as usize, m as usize).unwrap();
         let parities = rs.encode(&sources).unwrap();
-        let cwnd_before = t.cc.cwnd;
+        let cwnd_before = t.profile.congestion.snapshot().cwnd;
         // Deliver 3 of 4 data + both parities -> recover the missing one.
         t.handle_data(data_hdr(7, 0, k, m), sources[0].clone())
             .await;
@@ -2093,7 +2176,7 @@ mod tests {
             .await;
         t.handle_parity(parity_hdr(7, k + 1, k, m), parities[1].clone())
             .await;
-        let cwnd_after = t.cc.cwnd;
+        let cwnd_after = t.profile.congestion.snapshot().cwnd;
         assert_eq!(cwnd_after, cwnd_before);
     }
 
@@ -2102,7 +2185,7 @@ mod tests {
         let sent = Arc::new(StdMutex::new(Vec::new()));
         let mut tunnel = build_tunnel(sent).await;
         let m_before = tunnel.fec.params().m;
-        let cwnd_before = tunnel.cc.cwnd;
+        let cwnd_before = tunnel.profile.congestion.snapshot().cwnd;
         let mut group = RxGroup::new(2, 1);
         group.deadline = Instant::now() - Duration::from_secs(1);
         tunnel.rx_groups.insert(99, group);
@@ -2110,7 +2193,7 @@ mod tests {
         tunnel.evict_expired_rx_groups();
 
         assert_eq!(tunnel.fec.params().m, m_before);
-        assert_eq!(tunnel.cc.cwnd, cwnd_before);
+        assert_eq!(tunnel.profile.congestion.snapshot().cwnd, cwnd_before);
     }
 
     /// Session timeout: if no traffic arrives from the peer within the
