@@ -23,8 +23,8 @@
 //!   message ([`FrameCodec::route_prefix_len`]) — this is what lets a server
 //!   demux many sessions off one socket without decrypting anything.
 //! - Bounding its own header size ([`FrameCodec::max_header_len`]) so the MTU
-//! and routing-whitening budgets can be computed without knowing which codec
-//! is in use.
+//!   and routing-whitening budgets can be computed without knowing which codec
+//!   is in use.
 //!
 //! # What a codec is *not* responsible for
 //!
@@ -538,7 +538,7 @@ mod tests {
             let c = make();
             let probe = c.encode_frame(&sample(), b"");
             // The first two bytes are each codec's discriminator.
-            let key = (&probe[..c.route_prefix_len().min(2)]).to_vec();
+            let key = probe[..c.route_prefix_len().min(2)].to_vec();
             if let Some(prev) = seen.insert(key.clone(), c.name()) {
                 panic!(
                     "{} and {} share a wire prefix {key:?}; a routing peek could \
@@ -625,7 +625,7 @@ pub const V2_TLV_PREAMBLE: usize = 3;
 /// future field needs a new fixed-layout codec. This layout is
 /// self-describing instead, so:
 ///
-/// - a frame is only as long as its fields warrant -- a `Ping` is 11 bytes
+/// - a frame is only as long as its fields warrant -- a `Ping` is 21 bytes
 ///   against v1's 24 -- and
 /// - a new optional field can be added without a new codec — an old decoder
 ///   skips a tag it does not know, exactly as it already skips unknown flag
@@ -651,7 +651,7 @@ pub const V2_TLV_PREAMBLE: usize = 3;
 /// header is *larger* than v1's 24 bytes (49 here). A **sparse** one is much
 /// smaller, because a field left at its zero default is omitted entirely and
 /// decodes back to zero. In practice most frames are sparse -- a `Ping` has no
-/// ack, no FEC and no flags, and lands at 11 bytes.
+/// ack, no FEC and no flags, and lands at 21 bytes against v1's flat 24.
 ///
 /// So this is not a general-purpose compaction, and it is not claimed to be.
 /// The win is extensibility: a new optional field costs a tag, not a re-layout
@@ -976,24 +976,38 @@ mod tlv_tests {
     fn a_sparse_header_beats_v1_and_a_full_one_loses_to_it() {
         // The honest tradeoff, pinned so the doc comment cannot drift. A TLV
         // costs two bytes per field, so a fully populated header is larger than
-        // v1's fixed 24; a sparse one is much smaller, because zero-valued
-        // fields are omitted.
+        // v1's fixed 24; a sparse one is smaller, because zero-valued fields are
+        // omitted.
+        //
+        // The exact numbers are asserted, not just the ordering. Doc comments
+        // that quote a size drift the moment the layout changes, and "a Ping is
+        // 11 bytes" sat wrong in three documents before this test existed.
         let v1 = V1FixedCodec::new();
 
         // Sparse: a Ping with no ack, no FEC, no flags.
+        //   3 (preamble) + (2+1 version) + (2+1 type) + (2+4 session) + (2+4 seq) = 21
         let sparse = PacketHeader::new(PacketType::Ping, 0xCAFEBABE, 1);
         let v1_len = v1.encode_frame(&sparse, b"").len();
         let v2_len = V2TlvCodec::new().encode_frame(&sparse, b"").len();
         assert_eq!(v1_len, 24, "v1 is always 24 bytes");
+        assert_eq!(v2_len, 21, "the size quoted in the docs for a sparse frame");
         assert!(
             v2_len < v1_len,
             "a sparse v2 header ({v2_len}) must beat v1 ({v1_len})"
         );
 
-        // Full: every field set, which is the worst case for a TLV.
+        // Full: every *writable* field set, which is the worst case for a TLV.
+        //   21 + (2+4 ack_seq) + (2+4 ack_bitmap) + (2+2 group)
+        //      + (2+1 index) + (2+1 k) + (2+1 m) = 46
+        //
+        // The flags field is not counted because no `HeaderFlags` bits are
+        // assigned, so its TLV is never emitted. `max_header_len` still budgets
+        // for it (49), which is correct for an upper bound and is what the
+        // MTU math relies on.
         let full = sample();
         let v1_len = v1.encode_frame(&full, b"").len();
         let v2_len = V2TlvCodec::new().encode_frame(&full, b"").len();
+        assert_eq!(v2_len, 46, "the size quoted in the docs for a full frame");
         assert!(
             v2_len > v1_len,
             "a fully populated v2 header ({v2_len}) is expected to exceed v1 ({v1_len}); \
@@ -1032,7 +1046,8 @@ mod tlv_tests {
             (u32::MAX, u32::MAX, PacketType::Close),
             (0xCAFEBABE, 7, PacketType::Fec),
         ] {
-            for mut h in [PacketHeader::new(ptype, sid, seq)] {
+            let mut h = PacketHeader::new(ptype, sid, seq);
+            {
                 h.ack_seq = u32::MAX;
                 h.ack_bitmap = u32::MAX;
                 h.fec_group = u16::MAX;

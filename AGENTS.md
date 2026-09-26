@@ -38,8 +38,11 @@ src/
   daemon/mod.rs       persistent daemon: owns tunnel task + IPC server
   ipc/                Unix-socket IPC (newline-delimited JSON)
   tunnel/             steady-state tunnel + Noise IK handshake + peer auth + keepalives
-  protocol/           wire format: 24-byte header, codec, session/replay/acks
+  protocol/           wire format: PacketHeader + the swappable header codec
+                      (frame.rs), session/replay/acks, profile negotiation
   crypto/             Noise IK handshake, ChaCha20-Poly1305 AEAD, X25519 keys
+  carrier/            swappable byte carrier: Carrier / CarrierListener traits
+                      (UdpCarrier / TcpCarrier) — what the bytes travel over
   transport/          swappable wrap/unwrap trait (PlainTransport / TaggedTransport)
   obfuscation/        stackable, composable obfuscation transforms (padding / timing /
                       header_xor) applied on top of Transport, off by default
@@ -50,9 +53,12 @@ src/
                       + DNS leak prevention (DnsLeakGuard / ResolvConfGuard) + kill switch
                       (KillSwitch), all behind a swappable FirewallBackend for testability
 tests/
-  end_to_end.rs       loopback handshake + key-matching + kill-switch fail-closed drop tests
+  end_to_end.rs       loopback handshake + key-matching + kill-switch fail-closed
+                      drop tests, plus sessions over a TCP carrier and over the
+                      v2-tlv header layout
 doc/                  full design docs (start at doc/architecture.md, then
-                      doc/profiles.md for the swappable parts)
+                      doc/profiles.md for the swappable parts and
+                      doc/carrier.md for the byte-carrier seam)
 .github/workflows/    GitHub Actions: ci.yml (fmt/build/test + advisory clippy),
                       release.yml (tag-driven release artifact published to GitHub Releases)
 rust-toolchain.toml   pins the Rust toolchain (stable + rustfmt + clippy) for CI and local dev
@@ -69,6 +75,39 @@ rust-toolchain.toml   pins the Rust toolchain (stable + rustfmt + clippy) for CI
 - **The core never opens a TUN device directly.** It receives a `Box<dyn Tun>`
   from a `TunFactory`, including an already-open FD path (`from_fd`) for mobile
   hosts that get the FD from the OS.
+- **The seams are `Carrier` (bytes), `FrameCodec` (header encoding), `Handshake`
+  (KEX), `AeadCipher`, `Transport`, `FecScheme`, `CongestionControl` and
+  `ObfuscationLayer`.** Everything above them in `tunnel/` is written against
+  the traits. The two seams with non-obvious rules are the carrier and the codec:
+  a `Carrier` always yields exactly one *whole message* and owns any framing
+  needed for that, and the protocol never learns whether it is on a datagram or
+  a stream. A `FrameCodec` owns only the header's *encoding* — `PacketType`
+  stays a closed enum and the receive path's `match` on it stays exhaustive, so
+  a new packet type is still a compile error. Do not widen the seam to cover the
+  taxonomy; that trade was made deliberately and is documented in
+  `doc/profiles.md`.
+- **A datagram server must route a frame before it knows its codec**, because
+  routing identifies the session and the codec is per-session. That is why
+  `frame::peek_any_session_id` tries every codec in turn. It is only
+  unambiguous because each codec requires a distinct wire discriminator, which
+  a test enforces. A new codec added to `ALL_CODECS` without a distinct
+  discriminator will fail that test — do not work around it.
+- **`PacketType` must stay a closed enum.** Two codecs can encode the same
+  fields differently; that is the whole point of the seam. Making the taxonomy
+  runtime-configurable would cost the exhaustive `match` in the receive path for
+  no benefit.
+- **The carrier cannot be negotiated.** The negotiation travels over the carrier,
+  so there is no channel left to agree on it; like the KEX and the handshake
+  envelope it is config-pinned on both peers. A mismatch is *reported*, not
+  resolved — see `doc/carrier.md` for how.
+- **A stream carrier's `send` must never truncate its length prefix.** The TCP
+  carrier returns `InvalidInput` for an oversized message rather than casting the
+  length to `u16`, which would desynchronise the stream permanently.
+- **A codec's encoding must be exactly canonical.** The receive path re-encodes
+  the *decoded* header to rebuild the AEAD associated data, so
+  `encode(read(x)) == x` or every packet fails its tag check. This is why
+  `V2TlvCodec` writes tags in ascending order and omits zero-valued fields
+  rather than depending on map iteration order.
 - **The `Transport` trait is the envelope seam; `ObfuscationLayer` is the
   stackable transform seam.** Raw packets go through `Transport::wrap`/`unwrap`
   (the envelope). On top of that, an optional `ObfuscationStack`
@@ -80,8 +119,9 @@ rust-toolchain.toml   pins the Rust toolchain (stable + rustfmt + clippy) for CI
   the `[obfuscation]` TOML section. See `doc/obfuscation.md`.
 - **Every swappable part goes behind a trait + a name registry, and is built
   from config — never from a `match` on a concrete type in the tunnel.** The
-  seams are `AeadCipher` (crypto/suite), `Transport` (transport), `FecScheme`
-  (fec), `CongestionControl` (congestion), `Handshake` (protocol/handshake) and
+  seams are `Carrier` (carrier), `FrameCodec` (protocol/frame), `AeadCipher`
+  (crypto/suite), `Transport` (transport), `FecScheme` (fec),
+  `CongestionControl` (congestion), `Handshake` (protocol/handshake) and
   `ObfuscationLayer` (obfuscation). Each has a `build_*`/`select_*` registry and
   a stable wire id. Adding an option must not require touching `tunnel/`,
   `daemon/` or the config plumbing — see `doc/profiles.md`.
@@ -98,7 +138,10 @@ rust-toolchain.toml   pins the Rust toolchain (stable + rustfmt + clippy) for CI
 - **The server is authoritative in negotiation; the client may not be.** The
   responder walks its own preference order first, then falls back to a
   client-offered option it can run, then rejects. A profile is accepted or
-  rejected as a unit — never half-negotiated.
+  rejected as a unit — never half-negotiated. Note the fallback asks "can this
+  *build* run it", not "is it in the server's configured list" — so a server's
+  config order is a preference, not a constraint, and cannot be used to forbid
+  something. A test pins this.
 - **An unknown part name is a hard error, not warn-and-skip** (the one exception
   is `[obfuscation] layers`). A silent fallback leaves the peers in different
   configurations, and the symptom is near-undiagnosable. Validate once at
@@ -106,10 +149,13 @@ rust-toolchain.toml   pins the Rust toolchain (stable + rustfmt + clippy) for CI
 - **No invented cryptography.** Use Noise IK (already implemented), X25519,
   HKDF-SHA256, ChaCha20-Poly1305. Do not roll custom crypto.
 - **The negotiation channel is the Noise message payloads, so keep it
-  backwards compatible.** Message 2's payload slot is purely additive and always
-  safe. Message 1 has no payload slot, so appending one is a wire change: the
-  client's offer is opt-in via `[handshake] propose`, default `false`, which
-  keeps default-configured peers byte-identical to pre-negotiation builds.
+  backwards compatible.** Every new negotiated part must be **appended** to both
+  payloads, and the decoders must tolerate the shorter legacy form: a six-byte
+  `Selection` and a three-list `ClientOffer` both mean "the defaults". Message 2's
+  payload slot is purely additive and always safe. Message 1 has no payload slot,
+  so appending one is a wire change: the client's offer is opt-in via
+  `[handshake] propose`, default `false`, which keeps default-configured peers
+  byte-identical to pre-negotiation builds.
 - **Data is best-effort; only control/handshake messages are reliable.**
   Reliability for data is the FEC layer's job, not a retransmission loop.
 - **Daemon owns state; CLI is a thin IPC client.** Never relaunch the VPN to
@@ -121,7 +167,7 @@ rust-toolchain.toml   pins the Rust toolchain (stable + rustfmt + clippy) for CI
 ```sh
 cargo build                      # debug build
 cargo build --release            # release build
-cargo test                       # all tests (558 passing)
+cargo test                       # all tests (631 passing)
 cargo test --lib                 # unit tests only
 cargo test --test end_to_end     # integration tests only
 

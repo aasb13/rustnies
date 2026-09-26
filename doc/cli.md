@@ -304,8 +304,9 @@ A CLI flag only takes effect when actually passed, so an omitted flag does
 ### Unknown keys
 
 Unknown keys at any level (top-level sections, `[tun]` / `[nat]` /
-`[obfuscation]` / `[handshake]` / `[crypto]` / `[transport]` / `[fec]` /
-`[congestion]` sub-tables, or `[[peers]]` entries) produce a `WARN` log line but
+`[obfuscation]` / `[carrier]` / `[handshake]` / `[crypto]` / `[transport]` /
+`[frame]` / `[fec]` / `[congestion]` sub-tables, or `[[peers]]` entries) produce a
+`WARN` log line but
 do **not** prevent the daemon from starting. This means a typo never locks you
 out of your own config. Check the daemon logs at startup for
 `unknown config key; ignored` warnings if a setting seems to have no effect.
@@ -314,8 +315,9 @@ out of your own config. Check the daemon logs at startup for
 
 A typo in a *key* is a `WARN` and is ignored. A typo in a *protocol part name*
 (`[crypto] aead = ["aes-gcm"]`, `[congestion] algorithm = "bbr"`,
-`[handshake] kex = "x25519"`) is a **hard error** and the daemon refuses to
-start, with the offending string in the message.
+`[handshake] kex = "x25519"`, `[frame] codec = ["tlv"]`, `[carrier] name = "kcp"`)
+is a **hard error** and the daemon refuses to start, with the offending string in
+the message.
 
 This asymmetry is deliberate. An unknown key means a setting silently has no
 effect — annoying but recoverable. An unknown part name would otherwise leave
@@ -329,11 +331,19 @@ See [`profiles.md`](profiles.md) for the full list.
 
 ### Protocol profile sections
 
-`[handshake]`, `[crypto]`, `[transport]`, `[fec] scheme` and `[congestion]`
-select which implementation of each swappable protocol part a session runs. They
-are **TOML only** — no CLI flags — and are documented in full in
-[`profiles.md`](profiles.md). Omitting them entirely leaves the pre-negotiation
-protocol, which is still what a stock install runs.
+`[carrier]`, `[handshake]`, `[crypto]`, `[transport]`, `[frame]`, `[fec] scheme`
+and `[congestion]` select which implementation of each swappable protocol part a
+session runs. They are **TOML only** — no CLI flags — and are documented in full
+in [`profiles.md`](profiles.md), with the carrier seam in
+[`carrier.md`](carrier.md). Omitting them entirely leaves the pre-negotiation
+protocol over UDP, which is still what a stock install runs.
+
+Two of them are **not** negotiated and must be named identically on both peers:
+`[carrier] name` and `[handshake] kex` (plus `[transport] handshake`). The
+negotiation itself travels over them, so there is no channel left to agree on
+them — see [`profiles.md`](profiles.md#why-some-parts-are-not-negotiated). A
+mismatch is reported rather than resolved, though a carrier mismatch is
+diagnosable by name when `[handshake] propose = true`.
 
 ### Server config (`server.toml`)
 

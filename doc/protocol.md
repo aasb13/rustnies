@@ -1,16 +1,21 @@
 # Protocol and wire format
 
-rustnies uses a custom protocol over UDP. Every datagram on the wire is the
-output of the `Transport` layer's `wrap` applied to a *plaintext frame*. In
-phase 1 the default `Transport` is the identity `PlainTransport`, so the wire
-bytes equal the plaintext frame. See [transport.md](transport.md) for how the
-wrap/unwrap step is factored out.
+rustnies uses a custom protocol. Every message on the wire is the output of the
+`Transport` layer's `wrap` applied to a *plaintext frame*. The default
+`Transport` is the identity `PlainTransport`, so the wire bytes equal the
+plaintext frame. See [transport.md](transport.md) for how the wrap/unwrap step
+is factored out, and [carrier.md](carrier.md) for what the bytes travel over
+(UDP or TCP).
 
 ## Plaintext frame
 
 ```
 [ cleartext header (24 bytes) ][ encrypted payload (ciphertext + 16-byte tag) ]
 ```
+
+The header length above is the default (`v1-fixed`). The *encoding* is
+swappable — see "Header codecs" below — but the frame shape is always
+`header || sealed payload`.
 
 The header is **authenticated** (passed as AEAD associated data) but **not
 encrypted**. This lets a receiver route, replay-filter, and sequence packets
@@ -21,11 +26,53 @@ end-to-end.
 
 Encryption is ChaCha20-Poly1305; see [crypto.md](crypto.md).
 
-## Packet header (24 bytes)
+## Header codecs
+
+The header's **encoding** is a negotiated part (`[frame] codec`). What is *not*
+swappable is the packet taxonomy: `PacketType` stays a closed `#[repr(u8)]`
+enum, and the receive path's `match` on it stays exhaustive, so adding a packet
+type is a compile error until every site handles it.
+
+| Name | Layout |
+|---|---|
+| `v1-fixed` | The packed 24-byte header below. The default, and byte-identical to a pre-seam build. |
+| `v2-tlv` | A self-describing tag-length-value header. Omit zero-valued fields, skip unknown tags. |
+
+`protocol::frame::FrameCodec` owns the encoding: `write_header` / `read_header`
+for serialisation, `encode_header` for the AEAD associated data, `body_offset`
+to find where the body starts, and `peek_session_id` for server routing.
+
+Two invariants a codec must uphold, both pinned by tests:
+
+- **Round-trip stability.** The receive path re-encodes the *decoded* header to
+  rebuild the AEAD associated data, so `encode(read(x))` must equal `x` exactly.
+  A codec that is not canonical would authenticate a different byte string than
+  the sender sealed, and every packet would fail.
+- **A distinct wire discriminator.** A datagram server must route a frame
+  before it knows its session, and therefore before it knows its codec, so the
+  routing peek (`peek_any_session_id`) tries each codec in turn. That is only
+  unambiguous if no two codecs accept the same buffer.
+
+### v2-tlv, in brief
+
+```text
+[0]      magic (0x52)
+[1..3]   total header length, u16 big-endian (excluding this preamble)
+then, repeated: [tag u8][len u8][value, len bytes]
+```
+
+Tags are written in ascending order, which is what makes the encoding canonical.
+A field left at its zero default is omitted and decodes back to zero, so a sparse
+frame is smaller than v1's fixed 24 bytes (a `Ping` is 21). The cost is two
+bytes per field, so a *fully populated* header is larger (46 vs 24). The win is
+extensibility — a new optional field costs a tag, not a re-layout — not size.
+
+## Packet header: `v1-fixed` (24 bytes)
 
 All multi-byte fields are little-endian, packed. Serialisation is hand-rolled
-(`PacketHeader::write_to` / `read_from`) so the wire format is byte-stable and
-has no serde on the hot path.
+(`PacketHeader::write_to` / `read_from`, reached through
+`V1FixedCodec`) so the wire format is byte-stable and has no serde on the hot
+path.
 
 | Offset | Size | Field        | Meaning                                                       |
 |--------|------|--------------|---------------------------------------------------------------|
@@ -49,7 +96,12 @@ Constants live in `src/protocol/header.rs`:
 - `OUTER_OVERHEAD = 28` (UDP 8 + IPv4 20 on the wire; IPv6 outers cost 48)
 - `PATH_MTU = 1500` (assumed path MTU for the outer UDP datagrams)
 - `MAX_PAYLOAD = 1400 - HEADER_LEN - AEAD_TAG_LEN` (1360: largest TUN payload
-  per Data datagram)
+  per Data message, using the `v1-fixed` header length)
+
+Note that `MAX_PAYLOAD` is expressed against the compiled-in `v1-fixed` header
+length. A codec with a larger header shrinks the usable payload, which is why
+`FrameCodec::max_header_len` exists and why the routing-whitening keystream is
+sized from the *negotiated* codec rather than from `HEADER_LEN`.
 
 Wire budget for a full-size payload with the default 1400-byte TUN MTU:
 
@@ -212,11 +264,26 @@ one layer up, in the tunnel: `MAX_PAYLOAD` on the TUN read path and
 
 ## Modularity
 
-The wire format above is fixed. The *implementations* it is driven by — the
-cipher, the datagram envelope, the FEC erasure code, the congestion controller,
-the key exchange — are selected per session from config, and most of them are
-negotiated in the Noise handshake. That is a separate concern from this
-document: see [`profiles.md`](profiles.md).
+The packet *taxonomy* above is fixed: `PacketType` is a closed enum and the
+receive path's `match` on it is exhaustive. Everything else is a swappable part
+selected per session from config, and most of them are negotiated in the Noise
+handshake:
+
+| Swappable | Trait | Not swappable | Trait |
+|---|---|---|---|
+| Byte carrier (UDP/TCP) | `carrier::Carrier` | Packet taxonomy | `PacketType` |
+| Key exchange | `protocol::handshake::Handshake` | | |
+| Header encoding | `protocol::frame::FrameCodec` | | |
+| AEAD cipher | `crypto::suite::AeadCipher` | | |
+| Message envelope | `transport::Transport` | | |
+| FEC erasure code | `fec::FecScheme` | | |
+| Congestion control | `congestion::CongestionControl` | | |
+
+The line is drawn around the *encoding*, not the *semantics*: two codecs can put
+the same fields on the wire in completely different ways, but there is still one
+fixed set of things a VPN does. That is a deliberate trade — see
+[`profiles.md`](profiles.md) for the reasoning, and
+[`carrier.md`](carrier.md) for the byte-carrier seam specifically.
 
 ## Session
 

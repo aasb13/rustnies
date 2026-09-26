@@ -2,7 +2,11 @@
 
 The raw packet (header + AEAD ciphertext) is never sent directly on the wire.
 It passes through a `Transport` layer that `wrap`s it into the bytes that
-actually go on UDP and `unwrap`s incoming bytes back into the plaintext frame.
+actually go on the carrier and `unwrap`s incoming bytes back into the plaintext
+frame. This is the swappable seam for the on-the-wire envelope shape. Note the
+carrier is a *separate* seam below this one: `Transport` shapes each message,
+while the `Carrier` decides what a message is (a datagram, or a length-delimited
+stream frame) — see [carrier.md](carrier.md).
 This is the swappable seam for the on-the-wire envelope shape. Stackable,
 composable obfuscation transforms (padding, timing, header whitening) plug in
 *on top of* the transport via the `ObfuscationLayer` stack — see
@@ -18,25 +22,28 @@ All transport code is in `src/transport/mod.rs`.
 pub trait Transport: Send + Sync + 'static {
     fn name(&self) -> &'static str;
     fn wrap(&self, frame: &[u8]) -> Vec<u8>;
-    fn unwrap(&self, datagram: &[u8]) -> Result<Vec<u8>, TransportError>;
+    fn unwrap(&self, message: &[u8]) -> Result<Vec<u8>, TransportError>;
     fn boxed_clone(&self) -> Box<dyn Transport>;
 }
 ```
 
-- `wrap` takes the *plaintext frame* produced by `protocol::codec` (the bytes
-  `header || ciphertext`) and returns the bytes to transmit on the UDP socket.
-- `unwrap` is the inverse: it takes the raw bytes received from the socket and
-  returns the plaintext frame for `protocol::codec::decode`.
+- `wrap` takes the *plaintext frame* produced by the negotiated `FrameCodec` (the
+  bytes `header || ciphertext`) and returns the bytes to transmit as one protocol
+  message.
+- `unwrap` is the inverse: it takes the raw bytes of one message and returns the
+  plaintext frame for the codec to split. Framing — whether a message is a
+  datagram or a length-delimited stream frame — is the carrier's job, not this
+  layer's; see [carrier.md](carrier.md).
 - `boxed_clone` lets a transport be held behind a trait object and duplicated
   across tasks (the handshake and tunnel each need their own copy).
 
 ### Design constraints
 
-Transports are **stateless per-datagram transforms** by design:
+Transports are **stateless per-message transforms** by design:
 
 - They are cheap and allocation-light.
 - They may **not** touch the socket, TUN, or session state.
-- They do not reorder or coalesce across datagrams. Any stateful shaping
+- They do not reorder or coalesce across messages. Any stateful shaping
   (reordering, coalescing, pacing to a mimicry profile) belongs in a higher
   layer that wraps the `Transport` or sits above it.
 
@@ -52,7 +59,7 @@ audit, and makes the abstraction real rather than a leaky placeholder.
 - `TooLarge(n)` -> the transport output exceeded a size bound.
 
 `wrap` is expected to be infallible for well-formed inputs. On the receive
-path, a `TransportError` causes the tunnel to drop the datagram silently (it is
+path, a `TransportError` causes the tunnel to drop the message silently (it is
 either foreign traffic or a corrupted frame).
 
 ## Provided implementations
@@ -60,7 +67,7 @@ either foreign traffic or a corrupted frame).
 ### `PlainTransport`
 
 Identity transform: `wrap` returns the frame verbatim, `unwrap` returns the
-datagram verbatim. This is the **phase 1 default** and the reference for any
+message verbatim. This is the **phase 1 default** and the reference for any
 future transport.
 
 ```rust
@@ -71,7 +78,7 @@ pub fn default_transport() -> Box<dyn Transport> {
 
 ### `TaggedTransport`
 
-Prepends a fixed 2-byte tag before every wrapped datagram and requires it on
+Prepends a fixed 2-byte tag before every wrapped message and requires it on
 unwrap. It exists primarily to prove the abstraction is real and as a skeleton
 for obfuscation work:
 
@@ -93,9 +100,10 @@ selected from the `[obfuscation]` TOML section. See
 [obfuscation.md](obfuscation.md).
 
 For an envelope-level / full-protocol mimicry transform that changes the raw
-datagram shape (e.g. TLS/JA3 fronting) — still future work — the `Transport`
+message shape (e.g. TLS/JA3 fronting) — still future work — the `Transport`
 trait is the seam. Because it is the only boundary between the protocol/crypto
-pipeline and the raw UDP bytes, adding such a transport looks like:
+pipeline and the bytes handed to the carrier, adding such a transport looks
+like:
 
 1. Implement `Transport` for a new type (e.g. `TlsFrontTransport`,
    `MimicryTransport`).

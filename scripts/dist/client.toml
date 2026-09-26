@@ -52,6 +52,12 @@ mtu = 1400
 # defaults shown here, which is the pre-negotiation protocol.
 # ---------------------------------------------------------------------------
 
+[carrier]
+# What the protocol's messages are carried on. "udp" is a datagram socket;
+# "tcp" is a length-delimited stream. Must be named identically on both sides:
+# the negotiation itself travels over the carrier, so it cannot be negotiated.
+name = "udp"
+
 [handshake]
 # Key exchange. Must be named identically in the server's and the client's
 # config: it carries the profile negotiation, so it cannot itself be negotiated.
@@ -75,6 +81,17 @@ handshake = "plain"
 # reuses the handshake envelope. The framing tag is server-side only: it travels
 # inside the negotiation answer, so do not set it here.
 data = ["same-as-handshake"]
+
+[frame]
+# How a packet header is encoded on the wire, as an ordered preference.
+# "v1-fixed" (the default) is the original packed 24-byte header; "v2-tlv" is
+# a self-describing variable-length layout. This one IS negotiated, so a client
+# offering both can talk to a server that only runs one.
+#
+# A server's order is a preference, not a constraint: if a client offers only
+# something this build can run, that wins. To actually forbid a layout, use a
+# firewall rule, not this list.
+codec = ["v1-fixed"]
 
 [fec]
 # Erasure code, as an ordered preference. The actual k/m come from the server's

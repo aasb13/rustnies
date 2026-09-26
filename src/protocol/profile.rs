@@ -978,6 +978,9 @@ impl LocalProfile {
     /// The one warn-and-skip case left in the codebase is the obfuscation layer
     /// list, where an unknown layer degrades confidentiality but leaves the
     /// tunnel working.
+    // Eight named config sections; the alternative is a struct of them, which
+    // would be a second place to forget a field.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_config(
         kex_name: &str,
         propose: bool,

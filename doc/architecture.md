@@ -23,17 +23,24 @@ src/
                       operator control commands (Revoke, ListSessions, Disconnect) to the
                       server dispatcher via ServerHandle.
     messages.rs       Request / Response enums (Status, Stop, Ping, Revoke, ListSessions, Disconnect).
+  carrier/
+    mod.rs            Byte-carrier seam: Carrier / CarrierListener traits, UdpCarrier,
+                      TcpCarrier (2-byte length-delimited), Inbound. See doc/carrier.md.
   tunnel/
-    mod.rs            Steady-state tunnel: TUN<->UDP pump, FEC, congestion, RTT, keepalives,
+    mod.rs            Steady-state tunnel: TUN<->carrier pump, FEC, congestion, RTT, keepalives,
                       TunnelExit enum, eviction-signal receiver.
-    handshake.rs      Noise IK handshake driver over UDP (retried, loss-tolerant).
+    handshake.rs      Noise IK handshake driver over a Carrier (retried, loss-tolerant).
     peers.rs          Server-side peer authorization list (`PeerAuth`) + runtime denylist.
     server.rs         Multi-client server dispatcher (SessionId-routed, roaming, cap eviction,
                       ControlCommand enum, ServerHandle, eviction-signal channel).
   protocol/
     mod.rs            Re-exports.
-    header.rs         24-byte compact PacketHeader, PacketType, HeaderFlags.
-    codec.rs          Packet encode/decode (header || ciphertext framing).
+    header.rs         PacketHeader (the semantic value), PacketType, HeaderFlags.
+    codec.rs          Packet (header || ciphertext) helpers; the frame *encoding*
+                      itself is swappable via frame.rs.
+    frame.rs          FrameCodec seam: header serialisation, body_offset, and the
+                      codec-agnostic server routing peek. V1FixedCodec (24-byte
+                      packed, the default) and V2TlvCodec (self-describing).
     session.rs        Session: sequencing, ReplayWindow, AckTracker,
                       session_id_from_hash.
     handshake.rs      Handshake trait (KEX seam), HandshakeError, build_handshake,
@@ -94,6 +101,10 @@ the platform-specific code is isolated at the edges:
         +---------+ +-------+ +-------+ +----------+ +-----------+
                           |
             +-----------------------------+
+            |  carrier/ (UDP | TCP)       |  byte pipe, below the protocol
+            +-----------------------------+
+                          |
+            +-----------------------------+
             |  tun/ (trait)               |  platform abstraction
             +-----------------------------+
                           |
@@ -122,14 +133,17 @@ handshake and whether the server installs NAT rules.
    the current sliding-window ack anchor + bitmap (piggybacked
    reverse-direction acks).
 3. The packet is AEAD-encrypted with the session's initiator->responder key,
-   using the 24-byte header as authenticated associated data (AAD). The nonce
+   using the encoded header as authenticated associated data (AAD). The nonce
    is `session_id || seq || direction || zero`.
 4. The plaintext frame `header || ciphertext` is passed through the
    `ObfuscationStack` (if configured; identity by default) and then the
    `Transport` layer's `wrap` (identity envelope in phase 1). Obfuscation
    transforms plug in via the `ObfuscationStack`, not `Transport::wrap`; see
    `doc/obfuscation.md` for the stackable layer system.
-5. The wrapped bytes are sent as one UDP datagram to the peer.
+5. The wrapped bytes are sent as one protocol *message* to the peer. On the
+   default `udp` carrier that is one datagram; on `tcp` the carrier adds a
+   2-byte length prefix and the bytes may span several reads. The tunnel does
+   not know which — see `doc/carrier.md`.
 6. The plaintext packet is also accumulated into the current FEC group. When
    the group reaches `k` source symbols, `m` parity symbols are encoded and
    transmitted as `Fec` packets (same header + AEAD + transport pipeline).
@@ -230,9 +244,12 @@ a client IP:port. Operationally this changes what server-side tooling can assume
 
 ### Receive path (both sides)
 
-1. A UDP datagram is received.
+1. One whole protocol message is received from the `Carrier` (which has already
+   done any stream reassembly).
 2. `Transport::unwrap` reverses the wrap step, yielding the plaintext frame.
-3. `codec::decode` splits the frame into `PacketHeader` + ciphertext.
+3. The negotiated `FrameCodec` splits the frame into `PacketHeader` +
+   ciphertext. The receive path then *re-encodes* the decoded header to rebuild
+   the AAD, so a codec's encoding must be exactly canonical.
 4. The ciphertext is AEAD-decrypted with the header as AAD. A failed tag
    drops the packet silently without applying its ACK fields.
 5. The authenticated peer's advertised `ack_seq`/`ack_bitmap` are observed
@@ -270,13 +287,29 @@ a client IP:port. Operationally this changes what server-side tooling can assume
 
 ## Key design decisions
 
-### Why UDP, with a custom protocol
+### Why UDP by default, with a custom protocol
 
 The target network environment blocks QUIC, and TCP's head-of-line blocking and
 in-order delivery are wrong for a latency-sensitive tunnel that wants to apply
 FEC and best-effort delivery to data while keeping only control messages
 reliable. A custom protocol over UDP gives full control over the wire format,
 sequencing, ack strategy, and FEC grouping.
+
+UDP is the **default, not the only option**. `[carrier] name = "tcp"` swaps in
+a length-delimited stream, which is useful where UDP is filtered but TCP is not.
+The trade is real: no roaming, one connection per session (so no shared-socket
+ multiplexing), and head-of-line blocking. It is a config change rather than a
+rewrite because the carrier is a seam — see `doc/carrier.md`.
+
+### Why the header *encoding* is swappable but the taxonomy is not
+
+`PacketType` stays a closed `#[repr(u8)]` enum and the receive path's `match` on
+it stays exhaustive, so a new packet type is a compile error until every site
+handles it. What the `[frame] codec` seam replaces is the byte *layout*:
+`v1-fixed` and `v2-tlv` put the same fields on the wire in entirely different
+ways. Making the taxonomy runtime-configurable would buy nothing — the set of
+things a VPN does is not a deployment choice — and would cost that
+compile-time check.
 
 ### Why Noise IK for the handshake
 

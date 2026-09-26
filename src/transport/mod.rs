@@ -12,8 +12,13 @@
 //! without touching the protocol, crypto, FEC or TUN layers.
 //!
 //! Transport implementations are *stateless transforms on individual
-//! datagrams* by design; any stateful shaping (reordering, coalescing) lives in
+//! messages* by design; any stateful shaping (reordering, coalescing) lives in
 //! a higher layer. This keeps the trait trivial to implement and reason about.
+//!
+//! Note the layering: this trait shapes the bytes of one protocol message, while
+//! the [`crate::carrier`] seam below it decides what a message *is* — a
+//! datagram, or a length-delimited frame on a stream. A transport never sees
+//! the carrier, and the carrier never sees the transport's shape.
 
 /// The error a transport may return. Wrapping is expected to be infallible for
 /// well-formed inputs, but unwrapping may fail if the incoming bytes don't
@@ -37,13 +42,15 @@ pub enum TransportError {
 pub trait Transport: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 
-    /// `frame` is the plaintext packet produced by [`crate::protocol::codec`].
-    /// Returns the bytes to actually transmit.
+    /// `frame` is the plaintext packet produced by the negotiated
+    /// [`crate::protocol::frame::FrameCodec`]. Returns the bytes to transmit as
+    /// one protocol message.
     fn wrap(&self, frame: &[u8]) -> Vec<u8>;
 
-    /// `datagram` is the raw bytes received from the UDP socket. Returns the
-    /// plaintext frame for [`crate::protocol::codec::decode`].
-    fn unwrap(&self, datagram: &[u8]) -> Result<Vec<u8>, TransportError>;
+    /// `message` is the raw bytes of one whole message from the
+    /// [`crate::carrier::Carrier`]. Returns the plaintext frame for the codec to
+    /// split.
+    fn unwrap(&self, message: &[u8]) -> Result<Vec<u8>, TransportError>;
 
     /// Derive per-session keying material from the handshake hash. Called once
     /// per session, after the handshake completes and before the first
@@ -76,8 +83,8 @@ impl Transport for PlainTransport {
         frame.to_vec()
     }
 
-    fn unwrap(&self, datagram: &[u8]) -> Result<Vec<u8>, TransportError> {
-        Ok(datagram.to_vec())
+    fn unwrap(&self, message: &[u8]) -> Result<Vec<u8>, TransportError> {
+        Ok(message.to_vec())
     }
 
     fn boxed_clone(&self) -> Box<dyn Transport> {
@@ -89,7 +96,7 @@ impl Transport for PlainTransport {
 /// prove the abstraction is real (and as a skeleton for obfuscation work).
 #[derive(Debug, Default, Clone)]
 pub struct TaggedTransport {
-    /// A fixed 2-byte tag placed before every wrapped datagram.
+    /// A fixed 2-byte tag placed before every wrapped message.
     pub tag: [u8; 2],
 }
 
@@ -105,14 +112,14 @@ impl Transport for TaggedTransport {
         out
     }
 
-    fn unwrap(&self, datagram: &[u8]) -> Result<Vec<u8>, TransportError> {
-        if datagram.len() < self.tag.len() {
+    fn unwrap(&self, message: &[u8]) -> Result<Vec<u8>, TransportError> {
+        if message.len() < self.tag.len() {
             return Err(TransportError::UnwrapFailed);
         }
-        if &datagram[..self.tag.len()] != &self.tag {
+        if &message[..self.tag.len()] != &self.tag {
             return Err(TransportError::UnwrapFailed);
         }
-        Ok(datagram[self.tag.len()..].to_vec())
+        Ok(message[self.tag.len()..].to_vec())
     }
 
     fn boxed_clone(&self) -> Box<dyn Transport> {
@@ -136,7 +143,7 @@ pub fn default_transport() -> Box<dyn Transport> {
 // and a `boxed_clone` so each session gets its own copy.
 //
 // Unlike `[obfuscation]`, `[transport]` has two entries because the handshake
-// and steady-state datagrams can legitimately use different envelopes:
+// and steady-state messages can legitimately use different envelopes:
 //   * `handshake` wraps message 1 / message 2, which are encoded *before* any
 //     session key material exists, so it is config-only and must match on both
 //     peers. There is nothing to negotiate it against.

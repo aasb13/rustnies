@@ -2184,6 +2184,9 @@ log_file = "/var/log/rustnies/c.log"
     // mistake in any of those silently changes what a deployment negotiates.
 
     const FULL_PROFILE_TOML: &str = r#"
+[carrier]
+name = "udp"
+
 [handshake]
 kex = "noise-ik"
 propose = true
@@ -2195,6 +2198,9 @@ aead = ["chacha20poly1305"]
 handshake = "plain"
 data = ["tagged", "same-as-handshake"]
 tag_hex = "abcd"
+
+[frame]
+codec = ["v1-fixed", "v2-tlv"]
 
 [fec]
 scheme = ["reed-solomon"]
@@ -2334,6 +2340,7 @@ algorithm = "none"
     #[test]
     fn every_profile_section_key_round_trips() {
         let server = ServerFileConfig::from_toml(FULL_PROFILE_TOML).unwrap();
+        assert!(server.carrier.is_some());
         assert!(server.handshake.is_some());
         assert!(server.crypto.is_some());
         assert!(server.transport.is_some());
@@ -2341,6 +2348,7 @@ algorithm = "none"
         assert!(server.congestion.is_some());
 
         let client = ClientFileConfig::from_toml(FULL_PROFILE_TOML).unwrap();
+        assert!(client.carrier.is_some());
         assert!(client.handshake.is_some());
         assert!(client.crypto.is_some());
         assert!(client.transport.is_some());
@@ -2351,9 +2359,11 @@ algorithm = "none"
         // right nesting level. Assert them literally so adding a field without
         // updating the schema fails here.
         for schema in [
+            &CARRIER_SCHEMA,
             &HANDSHAKE_SCHEMA,
             &CRYPTO_SCHEMA,
             &TRANSPORT_SCHEMA,
+            &FRAME_SCHEMA,
             &FEC_SCHEMA,
             &CONGESTION_SCHEMA,
         ] {
@@ -2362,9 +2372,11 @@ algorithm = "none"
                 "schema keys must be non-empty"
             );
         }
+        assert_eq!(CARRIER_SCHEMA.scalars, ["name"]);
         assert_eq!(HANDSHAKE_SCHEMA.scalars, ["kex", "propose"]);
         assert_eq!(CRYPTO_SCHEMA.scalars, ["aead"]);
         assert_eq!(TRANSPORT_SCHEMA.scalars, ["handshake", "data", "tag_hex"]);
+        assert_eq!(FRAME_SCHEMA.scalars, ["codec"]);
         assert_eq!(
             FEC_SCHEMA.scalars,
             ["scheme", "k", "min_m", "max_m", "initial_m"]
@@ -2373,7 +2385,15 @@ algorithm = "none"
 
         // And the sections must be reachable from the top level of both roles.
         for tables in [&SERVER_SCHEMA.tables, &CLIENT_SCHEMA.tables] {
-            for name in ["handshake", "crypto", "transport", "fec", "congestion"] {
+            for name in [
+                "carrier",
+                "handshake",
+                "crypto",
+                "transport",
+                "frame",
+                "fec",
+                "congestion",
+            ] {
                 assert!(
                     tables.iter().any(|(n, _)| *n == name),
                     "[{name}] must be in the top-level schema tables"
@@ -2501,6 +2521,8 @@ mod dist_template_tests {
         assert_eq!(merged.transport.data, ["same-as-handshake"]);
         assert_eq!(merged.fec.scheme, ["reed-solomon"]);
         assert_eq!(merged.congestion.algorithm, "tcp-reno");
+        assert_eq!(merged.carrier.name, "udp");
+        assert_eq!(merged.frame.codec, ["v1-fixed"]);
         resolve(&merged);
     }
 
@@ -2523,6 +2545,8 @@ mod dist_template_tests {
         assert_eq!(merged.transport.data, ["same-as-handshake"]);
         assert_eq!(merged.fec.scheme, ["reed-solomon"]);
         assert_eq!(merged.congestion.algorithm, "tcp-reno");
+        assert_eq!(merged.carrier.name, "udp");
+        assert_eq!(merged.frame.codec, ["v1-fixed"]);
         crate::protocol::profile::LocalProfile::from_role_config(
             &merged.handshake,
             &merged.crypto,
@@ -2550,5 +2574,6 @@ mod dist_template_tests {
         );
         assert_eq!(s.handshake.kex, c.handshake.kex);
         assert_eq!(s.transport.handshake, c.transport.handshake);
+        assert_eq!(s.carrier.name, c.carrier.name);
     }
 }
