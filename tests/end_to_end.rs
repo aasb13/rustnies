@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustnies::carrier::{Carrier, UdpCarrier, UdpListener};
 use rustnies::crypto::aead::Direction;
 use rustnies::crypto::keys::KeyPair;
 use rustnies::crypto::noise::{HandshakeRole, NoiseHandshake};
@@ -25,6 +26,15 @@ use rustnies::tunnel::{Tunnel, TunnelExit, handshake};
 
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc, watch};
+
+/// Wrap a raw test socket as a UDP carrier.
+///
+/// The tests drive real sockets (relays, loss injectors) rather than mock
+/// carriers, so they adapt at the seam boundary instead of re-plumbing every
+/// call site.
+fn udp_carrier(sock: &Arc<UdpSocket>, peer: SocketAddr) -> Arc<dyn Carrier> {
+    Arc::new(UdpCarrier::new(sock.clone(), peer))
+}
 /// An in-memory TUN that captures written packets into a channel and feeds
 /// canned packets back. Implements [`rustnies::tun::Tun`].
 #[allow(dead_code)]
@@ -108,7 +118,7 @@ async fn end_to_end_handshake_and_data() {
     let server_kp_clone = clone_keypair(&server_kp);
     let server_handle = tokio::spawn(async move {
         handshake::server(
-            server_sock.clone(),
+            udp_carrier(&server_sock, server_addr),
             server_kp_clone,
             default_profile(),
             &ObfuscationStack::new(),
@@ -121,7 +131,7 @@ async fn end_to_end_handshake_and_data() {
     let established_client = tokio::time::timeout(
         Duration::from_secs(5),
         handshake::client(
-            client_sock.clone(),
+            udp_carrier(&client_sock, server_addr),
             server_addr,
             &client_kp,
             server_kp.public,
@@ -405,10 +415,10 @@ async fn kill_switch_fail_closed_on_real_tunnel_drop() {
     // Run the Noise IK handshake over the real sockets.
     let server_kp_clone = clone_keypair(&server_kp);
     let server_handle = tokio::spawn({
-        let sock = server_sock.clone();
+        let carrier = udp_carrier(&server_sock, server_addr);
         async move {
             handshake::server(
-                sock,
+                carrier,
                 server_kp_clone,
                 default_profile(),
                 &ObfuscationStack::new(),
@@ -420,7 +430,7 @@ async fn kill_switch_fail_closed_on_real_tunnel_drop() {
     let established_client = tokio::time::timeout(
         Duration::from_secs(5),
         handshake::client(
-            client_sock.clone(),
+            udp_carrier(&client_sock, server_addr),
             server_addr,
             &client_kp,
             server_kp.public,
@@ -451,7 +461,7 @@ async fn kill_switch_fail_closed_on_real_tunnel_drop() {
     });
     let mut client_tunnel = Tunnel::from_handshake(
         client_tun,
-        client_sock.clone(),
+        udp_carrier(&client_sock, server_addr),
         established_client.peer,
         Session::new(established_client.session_id, SessionRole::Initiator),
         resolved_profile(&default_profile(), &established_client),
@@ -678,7 +688,7 @@ async fn bidirectional_data_through_two_tunnels() {
     let server_sock_for_hs = server_sock.clone();
     let server_handle = tokio::spawn(async move {
         handshake::server(
-            server_sock_for_hs,
+            udp_carrier(&server_sock_for_hs, server_addr),
             server_kp_clone,
             default_profile(),
             &ObfuscationStack::new(),
@@ -689,7 +699,7 @@ async fn bidirectional_data_through_two_tunnels() {
     let established_client = tokio::time::timeout(
         Duration::from_secs(5),
         handshake::client(
-            client_sock.clone(),
+            udp_carrier(&client_sock, server_addr),
             server_addr,
             &client_kp,
             server_kp.public,
@@ -726,7 +736,7 @@ async fn bidirectional_data_through_two_tunnels() {
 
     let mut client_tunnel = Tunnel::from_handshake(
         client_tun,
-        client_sock.clone(),
+        udp_carrier(&client_sock, server_addr),
         established_client.peer,
         Session::new(established_client.session_id, SessionRole::Initiator),
         resolved_profile(&default_profile(), &established_client),
@@ -740,7 +750,7 @@ async fn bidirectional_data_through_two_tunnels() {
     .unwrap();
     let mut server_tunnel = Tunnel::from_handshake(
         server_tun,
-        server_sock.clone(),
+        udp_carrier(&server_sock, server_addr),
         established_server.peer,
         Session::new(established_server.session_id, SessionRole::Responder),
         resolved_profile(&default_profile(), &established_server),
@@ -842,7 +852,7 @@ async fn data_flows_through_server_dispatcher() {
 
             let server_task = tokio::task::spawn_local(async move {
                 run_server(
-                    server_sock.clone(),
+                    Box::new(UdpListener::new(server_sock.clone(), server_addr)),
                     server_kp,
                     server_tun,
                     default_profile(),
@@ -868,7 +878,7 @@ async fn data_flows_through_server_dispatcher() {
             let established = tokio::time::timeout(
                 Duration::from_secs(5),
                 handshake::client(
-                    client_sock.clone(),
+                    udp_carrier(&client_sock, server_addr),
                     server_addr,
                     &client_kp,
                     server_pub,
@@ -892,7 +902,7 @@ async fn data_flows_through_server_dispatcher() {
 
             let mut client_tunnel = Tunnel::from_handshake(
                 client_tun,
-                client_sock.clone(),
+                udp_carrier(&client_sock, server_addr),
                 established.peer,
                 Session::new(established.session_id, SessionRole::Initiator),
                 resolved_profile(&default_profile(), &established),
@@ -1125,7 +1135,7 @@ async fn build_lossy_two_tunnels(
     let server_sock_for_hs = server_sock.clone();
     let server_handle = tokio::spawn(async move {
         handshake::server(
-            server_sock_for_hs,
+            udp_carrier(&server_sock_for_hs, server_addr),
             server_kp_clone,
             default_profile(),
             &ObfuscationStack::new(),
@@ -1136,7 +1146,7 @@ async fn build_lossy_two_tunnels(
     let established_client = tokio::time::timeout(
         Duration::from_secs(15),
         handshake::client(
-            client_sock.clone(),
+            udp_carrier(&client_sock, server_addr),
             relay_addr,
             &client_kp,
             server_pub,
@@ -1173,7 +1183,7 @@ async fn build_lossy_two_tunnels(
 
     let mut client_tunnel = Tunnel::from_handshake(
         client_tun,
-        client_sock.clone(),
+        udp_carrier(&client_sock, server_addr),
         established_client.peer,
         Session::new(established_client.session_id, SessionRole::Initiator),
         resolved_profile(&default_profile(), &established_server),
@@ -1187,7 +1197,7 @@ async fn build_lossy_two_tunnels(
     .unwrap();
     let mut server_tunnel = Tunnel::from_handshake(
         server_tun,
-        server_sock.clone(),
+        udp_carrier(&server_sock, server_addr),
         established_server.peer,
         Session::new(established_server.session_id, SessionRole::Responder),
         resolved_profile(&default_profile(), &established_server),
@@ -1690,6 +1700,14 @@ async fn data_flows_over_a_non_default_negotiated_profile() {
         )
     }
 
+    /// Wrap a raw test socket as a UDP carrier.
+    ///
+    /// The tests drive real sockets (relays, loss injectors) rather than mock
+    /// carriers, so they adapt at the boundary instead of re-plumbing every site.
+    fn udp_carrier(sock: &Arc<UdpSocket>, peer: SocketAddr) -> Arc<dyn Carrier> {
+        Arc::new(UdpCarrier::new(sock.clone(), peer))
+    }
+
     // --- handshake over loopback UDP ---
     let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let server_addr = server_sock.local_addr().unwrap();
@@ -1700,10 +1718,10 @@ async fn data_flows_over_a_non_default_negotiated_profile() {
     let obf = ObfuscationStack::new();
     let server_task = {
         let obf = ObfuscationStack::new();
-        let sock = server_sock.clone();
+        let carrier = udp_carrier(&server_sock, server_addr);
         let kp = clone_keypair(&server_kp);
         tokio::spawn(async move {
-            handshake::server(sock, kp, server_profile(), &obf)
+            handshake::server(carrier, kp, server_profile(), &obf)
                 .await
                 .expect("server handshake failed")
         })
@@ -1712,7 +1730,7 @@ async fn data_flows_over_a_non_default_negotiated_profile() {
     let established_client = tokio::time::timeout(
         Duration::from_secs(10),
         handshake::client(
-            client_sock.clone(),
+            udp_carrier(&client_sock, server_addr),
             server_addr,
             &client_kp,
             server_pub,
@@ -1782,7 +1800,7 @@ async fn data_flows_over_a_non_default_negotiated_profile() {
 
     let mut client_tunnel = Tunnel::from_handshake(
         client_tun,
-        client_sock.clone(),
+        udp_carrier(&client_sock, server_addr),
         established_client.peer,
         Session::new(established_client.session_id, SessionRole::Initiator),
         client_resolved,
@@ -1796,7 +1814,7 @@ async fn data_flows_over_a_non_default_negotiated_profile() {
     .unwrap();
     let mut server_tunnel = Tunnel::from_handshake(
         server_tun,
-        server_sock.clone(),
+        udp_carrier(&server_sock, server_addr),
         established_server.peer,
         Session::new(established_server.session_id, SessionRole::Responder),
         server_resolved,

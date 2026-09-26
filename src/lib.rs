@@ -6,8 +6,9 @@
 //! mobile (Android/iOS) hosts without rewriting the core.
 //!
 //! Layout:
-//! - [`protocol`]   — wire format, framing, session state, replay protection
+//! - [`protocol`]   — wire format, swappable header codec, session state, replay protection
 //! - [`crypto`]     — Noise IK handshake + ChaCha20Poly1305 AEAD
+//! - [`carrier`]    — swappable byte carrier (UDP / TCP)
 //! - [`transport`]  — swappable packet wrap/unwrap envelope
 //! - [`obfuscation`] — stackable, composable traffic-obfuscation transforms
 //! - [`fec`]        — adaptive forward error correction
@@ -21,6 +22,7 @@
 //! - [`config`]     — configuration types
 //! - [`stats`]      — live statistics
 
+pub mod carrier;
 pub mod cli;
 pub mod config;
 pub mod congestion;
@@ -37,5 +39,7 @@ pub mod transport;
 pub mod tun;
 pub mod tunnel;
 
+pub use carrier::{Carrier, CarrierListener, Inbound};
 pub use protocol::codec::Packet;
+pub use protocol::frame::FrameCodec;
 pub use protocol::header::{PacketHeader, PacketType, SessionId};

@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use tokio::net::UdpSocket;
+use crate::carrier::{Carrier, bind_carrier_listener, connect_carrier};
 use tokio::sync::{Mutex, mpsc, watch};
 
 use crate::config::{ClientConfig, ServerConfig, ServerFileConfig};
@@ -337,7 +337,7 @@ pub async fn run_client(mut cfg: ClientConfig) -> std::io::Result<()> {
         "client protocol profile resolved from config"
     );
 
-    // Reconnection loop. Each iteration binds a fresh ephemeral UDP socket,
+    // Reconnection loop. Each iteration opens a fresh carrier,
     // runs the Noise IK handshake, drives one tunnel session to completion,
     // then — if reconnection is enabled — starts again. A failed handshake
     // or a torn-down session is retried after an exponentially growing backoff
@@ -350,11 +350,13 @@ pub async fn run_client(mut cfg: ClientConfig) -> std::io::Result<()> {
             break;
         }
 
-        // Fresh ephemeral socket for this connection attempt.
-        let sock = match UdpSocket::bind("0.0.0.0:0").await {
-            Ok(s) => Arc::new(s),
+        // A fresh carrier for this connection attempt. For a datagram carrier
+        // that is a new ephemeral port each time (as before); for a stream
+        // carrier it is a fresh connection.
+        let carrier: Arc<dyn Carrier> = match connect_carrier(&cfg.carrier.name, cfg.server).await {
+            Ok(c) => Arc::from(c),
             Err(e) => {
-                tracing::error!(error = ?e, "failed to bind client udp socket");
+                tracing::error!(error = ?e, carrier = %cfg.carrier.name, "failed to open client carrier");
                 {
                     let mut c = counters.lock().await;
                     c.reconnecting = true;
@@ -371,7 +373,6 @@ pub async fn run_client(mut cfg: ClientConfig) -> std::io::Result<()> {
                 continue;
             }
         };
-        let _ = sock.connect(cfg.server).await; // optional; we always send_to explicit addr
 
         // Noise IK handshake. Stoppable: if the user hits Ctrl+C / IPC Stop
         // mid-handshake, bail out immediately rather than waiting for the
@@ -385,7 +386,7 @@ pub async fn run_client(mut cfg: ClientConfig) -> std::io::Result<()> {
                 break;
             }
             res = handshake::client(
-                sock.clone(),
+                carrier.clone(),
                 cfg.server,
                 &client_kp,
                 server_pub,
@@ -464,7 +465,7 @@ pub async fn run_client(mut cfg: ClientConfig) -> std::io::Result<()> {
         let session = Session::new(established.session_id, SessionRole::Initiator);
         let mut tunnel = Tunnel::from_handshake(
             tun,
-            sock.clone(),
+            carrier.clone(),
             established.peer,
             session,
             resolved,
@@ -485,7 +486,7 @@ pub async fn run_client(mut cfg: ClientConfig) -> std::io::Result<()> {
         // form. The task self-terminates when the tunnel's UDP receiver is
         // dropped at session end.
         let (udp_tx, udp_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1024);
-        tokio::spawn(socket_reader(sock.clone(), udp_tx));
+        tokio::spawn(socket_reader(carrier.clone(), udp_tx));
 
         let exit = tunnel.run(stop_tx.subscribe(), udp_rx).await;
 
@@ -558,7 +559,7 @@ pub async fn run_server(cfg: ServerConfig) -> std::io::Result<()> {
         ));
     }
 
-    let sock = Arc::new(UdpSocket::bind(cfg.listen).await?);
+    let listener = bind_carrier_listener(&cfg.carrier.name, cfg.listen).await?;
 
     let server_kp = KeyPair::load_or_create(&cfg.key_path)?;
     tracing::info!(
@@ -726,7 +727,7 @@ pub async fn run_server(cfg: ServerConfig) -> std::io::Result<()> {
 
     // Run the multi-client accept/dispatch loop until stopped.
     server::run_server(
-        sock,
+        listener,
         server_kp,
         tun,
         local_profile,
@@ -824,20 +825,21 @@ fn spawn_sighup(_peer_auth: Arc<StdMutex<PeerAuth>>, _config_path: Option<std::p
     // SIGHUP is Unix-only; non-Unix hosts restart to reload peers.
 }
 
-/// Read UDP datagrams from `sock` and forward them onto `tx` until the socket
-/// closes or all receivers are dropped. Used by the client so its tunnel can
-/// receive via the same channel form the server uses.
-async fn socket_reader(sock: Arc<UdpSocket>, tx: mpsc::Sender<(Vec<u8>, SocketAddr)>) {
-    let mut buf = vec![0u8; 65535];
+/// Read whole messages from `carrier` and forward them onto `tx` until the
+/// carrier errors or all receivers are dropped. Used by the client so its
+/// tunnel can receive via the same channel form the server uses.
+async fn socket_reader(carrier: Arc<dyn Carrier>, tx: mpsc::Sender<(Vec<u8>, SocketAddr)>) {
     loop {
-        match sock.recv_from(&mut buf).await {
-            Ok((n, from)) => {
-                if tx.send((buf[..n].to_vec(), from)).await.is_err() {
+        // The carrier yields one whole message per recv, so there is no
+        // datagram-vs-stream distinction to handle here.
+        match carrier.recv().await {
+            Ok((data, from)) => {
+                if tx.send((data.to_vec(), from)).await.is_err() {
                     break; // tunnel gone
                 }
             }
             Err(e) => {
-                tracing::warn!(error = ?e, "client udp recv error; socket reader exiting");
+                tracing::warn!(error = ?e, carrier = carrier.name(), "client carrier recv error; reader exiting");
                 break;
             }
         }

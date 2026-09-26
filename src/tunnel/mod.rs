@@ -13,13 +13,13 @@ pub mod handshake;
 pub mod peers;
 pub mod server;
 
+use crate::carrier::Carrier;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc, watch};
 
 use crate::crypto::aead::Direction;
@@ -176,7 +176,12 @@ impl RxGroup {
 /// [`Tunnel`] only runs a single task so most state lives on `&mut self`.
 pub struct Tunnel {
     pub tun: Box<dyn crate::tun::Tun>,
-    pub sock: Arc<UdpSocket>,
+    /// The byte carrier. Swappable via the `[carrier]` config section, so the
+    /// same tunnel drives a UDP socket or a length-delimited TCP connection.
+    pub carrier: Arc<dyn Carrier>,
+    /// Where to send. Tracked separately from `carrier` because a roaming
+    /// datagram carrier can move it mid-session while a stream carrier cannot
+    /// (see [`Carrier::supports_roaming`]).
     pub peer: SocketAddr,
     pub session: Session,
     /// The negotiated protocol profile: the per-packet cipher, the steady-state
@@ -281,7 +286,7 @@ impl Tunnel {
     /// [`ObfuscationStack::init`] if it contains keying-based layers.
     pub fn from_handshake(
         tun: Box<dyn crate::tun::Tun>,
-        sock: Arc<UdpSocket>,
+        carrier: Arc<dyn Carrier>,
         peer: SocketAddr,
         session: Session,
         profile: ResolvedProfile,
@@ -302,7 +307,7 @@ impl Tunnel {
         let params = fec.params();
         Ok(Self {
             tun,
-            sock,
+            carrier,
             peer,
             session,
             profile,
@@ -808,7 +813,7 @@ impl Tunnel {
             self.profile.congestion.refund_send_bytes(len as u64);
             return false;
         }
-        if let Err(e) = self.sock.send_to(&wire, self.peer).await {
+        if let Err(e) = self.carrier.send(&wire, self.peer).await {
             tracing::warn!(error = ?e, seq, peer = %self.peer, "udp send failed; dropping tun packet");
             self.profile.congestion.refund_send_bytes(len as u64);
             return false;
@@ -937,7 +942,7 @@ impl Tunnel {
                         self.profile.congestion.refund_send_bytes(plen as u64);
                         continue;
                     }
-                    if let Err(e) = self.sock.send_to(&wire, self.peer).await {
+                    if let Err(e) = self.carrier.send(&wire, self.peer).await {
                         tracing::debug!(
                             error = ?e, seq, peer = %self.peer,
                             "fec parity udp send failed; parity datagram lost"
@@ -1037,7 +1042,7 @@ impl Tunnel {
         let frame = codec::encode_raw(&hdr, &ct);
         let wire = self.wrap_frame(&frame);
         tracing::trace!(ptype = ?ptype, seq, len = payload.len(), "send packet");
-        if let Err(e) = self.sock.send_to(&wire, self.peer).await {
+        if let Err(e) = self.carrier.send(&wire, self.peer).await {
             tracing::debug!(
                 error = ?e, ptype = ?ptype, seq, peer = %self.peer,
                 "best-effort udp send failed"
@@ -1072,7 +1077,7 @@ impl Tunnel {
             })?;
         let frame = codec::encode_raw(&hdr, &ct);
         let wire = self.wrap_frame(&frame);
-        self.sock.send_to(&wire, self.peer).await?;
+        self.carrier.send(&wire, self.peer).await?;
         if self.outstanding.len() < MAX_OUTSTANDING_CONTROL {
             self.outstanding.push(Outstanding {
                 seq,
@@ -1175,7 +1180,7 @@ impl Tunnel {
         }
         for i in to_resend {
             let o = &mut self.outstanding[i];
-            if let Err(e) = self.sock.send_to(&o.payload, self.peer).await {
+            if let Err(e) = self.carrier.send(&o.payload, self.peer).await {
                 tracing::warn!(
                     error = ?e, seq = o.seq, ptype = ?o.ptype, peer = %self.peer,
                     "control retransmit send failed"
@@ -1593,6 +1598,7 @@ async fn evict_recv(rx: &mut Option<mpsc::UnboundedReceiver<()>>) -> Option<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::carrier::UdpCarrier;
     use crate::congestion::{CongestionKind, MIN_CWND_BYTES};
     use crate::crypto::aead::Direction;
     use crate::crypto::suite::AeadCipher;
@@ -1633,14 +1639,24 @@ mod tests {
     }
 
     async fn build_tunnel(sent: Arc<StdMutex<Vec<Vec<u8>>>>) -> Tunnel {
+        build_tunnel_with_sock(sent).await.0
+    }
+
+    /// As [`build_tunnel`], but also hands back the raw socket.
+    ///
+    /// The roaming tests observe datagrams arriving on the socket directly, so
+    /// they need it; everything else only cares about the tunnel.
+    async fn build_tunnel_with_sock(sent: Arc<StdMutex<Vec<Vec<u8>>>>) -> (Tunnel, Arc<UdpSocket>) {
+        let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let carrier = Arc::new(UdpCarrier::new(sock.clone(), peer));
         let session = Session::new(0xCAFEBABE, SessionRole::Initiator);
         let tun: Box<dyn Tun> = Box::new(CaptureTun { sent });
         let counters = Arc::new(Mutex::new(Counters::new()));
-        Tunnel::from_handshake(
+        let tunnel = Tunnel::from_handshake(
             tun,
-            sock,
-            "127.0.0.1:1".parse().unwrap(),
+            carrier,
+            peer,
             session,
             test_profile(&Selection::defaults()),
             crate::obfuscation::ObfuscationStack::new(),
@@ -1650,7 +1666,8 @@ mod tests {
             Direction::ResponderToInitiator,
             counters,
         )
-        .unwrap()
+        .unwrap();
+        (tunnel, sock)
     }
 
     /// A resolved profile with the default parts, built the same way the daemon
@@ -2227,8 +2244,9 @@ mod tests {
     #[tokio::test]
     async fn keepalive_round_trips() {
         let sent = Arc::new(StdMutex::new(Vec::new()));
-        let mut sender = build_tunnel(sent).await;
-        let mut receiver = build_tunnel(Arc::new(StdMutex::new(Vec::new()))).await;
+        let (mut sender, _sender_sock) = build_tunnel_with_sock(sent).await;
+        let (mut receiver, receiver_sock) =
+            build_tunnel_with_sock(Arc::new(StdMutex::new(Vec::new()))).await;
 
         // Make the receiver act as the responder: its recv_dir must match the
         // sender's send_dir (InitiatorToResponder), and its recv_key must equal
@@ -2239,7 +2257,7 @@ mod tests {
         receiver.recv_dir = Direction::InitiatorToResponder;
 
         // Point the sender's peer at the receiver's socket.
-        sender.peer = receiver.sock.local_addr().unwrap();
+        sender.peer = receiver_sock.local_addr().unwrap();
 
         // Send a keepalive from the sender.
         sender.send_keepalive().await;
@@ -2247,7 +2265,7 @@ mod tests {
         // The keepalive went out over the sender's socket to the receiver's
         // address. Read it on the receiver's socket and feed it through.
         let mut buf = vec![0u8; 65535];
-        let (n, from) = receiver.sock.recv_from(&mut buf).await.unwrap();
+        let (n, from) = receiver_sock.recv_from(&mut buf).await.unwrap();
         let result = receiver.handle_udp_datagram(&buf[..n], from).await;
         assert!(result.is_ok(), "keepalive decrypted and handled ok");
 
@@ -2267,8 +2285,9 @@ mod tests {
     #[tokio::test]
     async fn roaming_updates_peer_and_signals_after_successful_decrypt() {
         let sent = Arc::new(StdMutex::new(Vec::new()));
-        let mut sender = build_tunnel(sent).await;
-        let mut receiver = build_tunnel(Arc::new(StdMutex::new(Vec::new()))).await;
+        let (mut sender, sender_sock) = build_tunnel_with_sock(sent).await;
+        let (mut receiver, receiver_sock) =
+            build_tunnel_with_sock(Arc::new(StdMutex::new(Vec::new()))).await;
 
         let shared_key = [0xABu8; 32];
         sender.send_key = shared_key;
@@ -2283,14 +2302,14 @@ mod tests {
         // Set up the address-change signal channel (server-side only).
         let (addr_tx, mut addr_rx) = mpsc::unbounded_channel::<(SessionId, SocketAddr)>();
         receiver.set_addr_change_tx(addr_tx);
-        assert_ne!(receiver.peer, sender.sock.local_addr().unwrap());
+        assert_ne!(receiver.peer, sender_sock.local_addr().unwrap());
 
         // Send a keepalive from the sender to the receiver's socket.
-        sender.peer = receiver.sock.local_addr().unwrap();
+        sender.peer = receiver_sock.local_addr().unwrap();
         sender.send_keepalive().await;
 
         let mut buf = vec![0u8; 65535];
-        let (n, from) = receiver.sock.recv_from(&mut buf).await.unwrap();
+        let (n, from) = receiver_sock.recv_from(&mut buf).await.unwrap();
         // `from` is the sender's address, which differs from `original_peer`.
         assert_ne!(from, original_peer);
 

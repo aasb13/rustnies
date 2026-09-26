@@ -107,7 +107,7 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use tokio::net::UdpSocket;
+use crate::carrier::{Carrier, CarrierListener, Inbound};
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -375,6 +375,134 @@ struct ClientHandle {
 /// Run the multi-client server until `stop` is signalled.
 ///
 /// `sock` is the bound listening socket; `tun` is the single shared TUN device;
+/// Server-wide state that every inbound event needs.
+///
+/// Grouping these keeps the dispatch path (which now has to handle two
+/// different inbound shapes) readable, and means adding a field the dispatcher
+/// needs is a one-line change rather than a signature change threaded through
+/// four helpers.
+struct ServerCtx {
+    server_kp: KeyPair,
+    profile: LocalProfile,
+    obf_stack: obfuscation::SharedStack,
+    /// How to answer a datagram carrier. `None` for a stream carrier, where a
+    /// session's carrier comes from the accepted connection instead.
+    sender: Option<Arc<dyn Carrier>>,
+    peer_auth: Arc<StdMutex<PeerAuth>>,
+    counters: Arc<Mutex<Counters>>,
+    tun_write_tx: mpsc::Sender<(SessionId, Vec<u8>)>,
+    addr_change_tx: mpsc::UnboundedSender<(SessionId, SocketAddr)>,
+    stop_tx: watch::Sender<bool>,
+    tun_name: String,
+    tun_mtu: u32,
+    fec_config: crate::config::FecConfig,
+    max_sessions_per_peer: u8,
+    /// Whether sessions behind this server can roam (datagram carriers can,
+    /// stream carriers cannot). Read by the spawned tunnel.
+    roaming: bool,
+}
+
+/// The carrier a datagram server answers from, if it has one.
+///
+/// A stream listener returns `None`: there is no shared socket, and each
+/// session's carrier is the connection it was accepted on.
+fn ctx_sender(listener: &dyn CarrierListener) -> Option<Arc<dyn Carrier>> {
+    listener.sender()
+}
+
+/// Route one inbound datagram, or recognise it as a new handshake.
+///
+/// Dispatch order (SessionId is authoritative):
+/// 1. Peek-based route (strips the transport envelope + best-effort
+///    de-obfuscates with the *shared* stack, then per-session routing metadata
+///    if present). A live SessionId match is forwarded with its source address
+///    so the tunnel can detect roaming. Handshake bytes cannot produce a live
+///    peek match.
+/// 2. Handshake probe (rate-limited): recognises a fresh handshake from a known
+///    address as a NEW session, not a reconnect swallowed by the old tunnel.
+/// 3. `addr_index` fallback: covers packets whose header can't be peeked
+///    (whitened frames from a known address). Runs after the probe so a
+///    same-address reconnect is recognised.
+/// 4. Otherwise drop as scan noise.
+async fn dispatch_datagram(
+    ctx: &ServerCtx,
+    datagram: &[u8],
+    from: SocketAddr,
+    sessions: &mut HashMap<SessionId, ClientHandle>,
+    addr_index: &mut HashMap<SocketAddr, SessionId>,
+    probe_limiter: &mut ProbeLimiter,
+) {
+    // Step 1: peek-based route.
+    let mut forwarded = false;
+    if let Some(sid) = peek_routed_session(sessions, &*ctx.profile.handshake_transport, datagram) {
+        if let Some(h) = sessions.get_mut(&sid) {
+            if h.udp_tx.try_send((datagram.to_vec(), from)).is_ok() {
+                h.last_forwarded = Instant::now();
+                forwarded = true;
+            } else {
+                tracing::debug!(session_id = sid, from = %from, "session channel full/closed");
+            }
+        }
+    }
+    if forwarded {
+        return;
+    }
+
+    // Step 2: no live session claims this datagram. Before paying the
+    // asymmetric-crypto cost of `respond_message_1`, apply the per-source
+    // probe rate limiter so a flood of garbage cannot force unbounded crypto.
+    if !probe_limiter.allow(from) {
+        tracing::debug!(from = %from, "handshake probe rate-limited; dropping datagram");
+        return;
+    }
+    let Some(sender) = ctx.sender.clone() else {
+        tracing::debug!(from = %from, "no sender for a datagram on a stream server");
+        return;
+    };
+    if handle_handshake(ctx, datagram, from, sender, sessions, addr_index).await {
+        return;
+    }
+
+    // Step 3: not a handshake either — last resort is the addr_index cache
+    // (covers a whitened frame from a brand-new address before the tunnel has
+    // signalled a roam). A stale entry never misroutes: the tunnel's AEAD
+    // decrypt rejects foreign bytes.
+    if let Some(sid) = addr_fallback(sessions, addr_index, from)
+        && let Some(h) = sessions.get_mut(&sid)
+        && h.udp_tx.try_send((datagram.to_vec(), from)).is_ok()
+    {
+        h.last_forwarded = Instant::now();
+    } else if let Some(sid) = addr_fallback(sessions, addr_index, from) {
+        tracing::debug!(session_id = sid, from = %from, "addr-index session channel full/closed; dropping");
+    }
+}
+
+/// Run the handshake on a freshly accepted stream connection.
+///
+/// A stream connection cannot be shared, so there is nothing to peek-route or
+/// fall back on: the connection *is* the session. The first message must be a
+/// message 1, and every later message on this connection belongs to the
+/// session the handshake creates.
+async fn dispatch_connection(
+    ctx: &ServerCtx,
+    carrier: Arc<dyn Carrier>,
+    from: SocketAddr,
+    sessions: &mut HashMap<SessionId, ClientHandle>,
+    addr_index: &mut HashMap<SocketAddr, SessionId>,
+) {
+    tracing::debug!(from = %from, carrier = carrier.name(), "accepted a connection; expecting message 1");
+    let msg1 = match carrier.recv().await {
+        Ok((data, _)) => data,
+        Err(e) => {
+            tracing::debug!(from = %from, error = ?e, "connection closed before message 1");
+            return;
+        }
+    };
+    if !handle_handshake(ctx, &msg1, from, carrier, sessions, addr_index).await {
+        tracing::debug!(from = %from, "connection did not carry a valid message 1; dropping");
+    }
+}
+
 /// `transport` is cloned (via [`Transport::boxed_clone`]) per tunnel; `counters`
 /// is shared by all tunnels so IPC stats aggregate across clients. `obf_stack`
 /// is the shared obfuscation stack configuration; each client tunnel gets a
@@ -383,7 +511,7 @@ struct ClientHandle {
 /// operator commands (revoke, disconnect, list-sessions) from the IPC server.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_server(
-    sock: Arc<UdpSocket>,
+    listener: Box<dyn CarrierListener>,
     server_kp: KeyPair,
     mut tun: Box<dyn Tun>,
     profile: LocalProfile,
@@ -400,7 +528,7 @@ pub async fn run_server(
     mut control_rx: mpsc::Receiver<ControlCommand>,
 ) -> io::Result<()> {
     tracing::info!(
-        listen = %sock.local_addr()?,
+        listen = %listener.name(),
         open_mode = peer_auth.lock().unwrap_or_else(|e| e.into_inner()).is_open_mode(),
         "multi-client server running; accepting handshakes"
     );
@@ -434,8 +562,27 @@ pub async fn run_server(
     let mut sessions: HashMap<SessionId, ClientHandle> = HashMap::new();
     let mut addr_index: HashMap<SocketAddr, SessionId> = HashMap::new();
     let mut probe_limiter = ProbeLimiter::new();
-    let mut udp_buf = vec![0u8; 65535];
     let mut tun_buf = vec![0u8; 65535];
+
+    // A datagram carrier answers from its shared socket. A stream carrier has
+    // no shared sender: each session answers on its own accepted connection.
+    let sender = ctx_sender(&*listener);
+    let ctx = ServerCtx {
+        server_kp,
+        profile,
+        obf_stack: obf_stack.clone(),
+        sender,
+        peer_auth: peer_auth.clone(),
+        counters: counters.clone(),
+        tun_write_tx: tun_write_tx.clone(),
+        addr_change_tx: addr_change_tx.clone(),
+        stop_tx: stop_tx.clone(),
+        tun_name: tun_name.clone(),
+        tun_mtu,
+        fec_config: fec_config.clone(),
+        max_sessions_per_peer,
+        roaming: listener.preserves_boundaries(),
+    };
 
     // NOTE: no `biased` here on purpose (same reason as `Tunnel::run`):
     // a biased TUN-first poll starves UDP dispatch under load. With fair
@@ -601,100 +748,23 @@ pub async fn run_server(
                 }
             }
 
-            // UDP inbound: dispatch by SessionId, or run a handshake.
-            res = sock.recv_from(&mut udp_buf) => {
-                match res {
-                    Ok((n, from)) => {
-                        let datagram = &udp_buf[..n];
-                         // Dispatch order (SessionId is authoritative):
-                         // 1. Peek-based route (strips transport envelope + best-effort
-                         //    de-obfuscates with the *shared* stack, then per-session
-                         //    routing metadata if present). A live SessionId match is
-                         //    forwarded (with source addr for roaming detection).
-                         //    Handshake bytes cannot produce a live peek match.
-                         // 2. Handshake probe (rate-limited): recognises a fresh
-                         //    handshake from a known address as a NEW session, not a
-                         //    reconnect swallowed by the old tunnel.
-                         // 3. addr_index fallback: covers packets whose header can't be
-                         //    peeked (whitened frames from a known address). Runs after
-                         //    the probe so a same-address reconnect is recognised.
-                         // 4. Otherwise drop as scan noise.
-                         let mut forwarded = false;
-                         if let Some(sid) =
-                             peek_routed_session(&sessions, &*profile.handshake_transport, datagram)
-                         {
-                             if let Some(h) = sessions.get_mut(&sid) {
-                                 if h.udp_tx.try_send((datagram.to_vec(), from)).is_ok() {
-                                     h.last_forwarded = Instant::now();
-                                     forwarded = true;
-                                 } else {
-                                     tracing::debug!(
-                                         session_id = sid,
-                                         from = %from,
-                                         "session udp channel full/closed"
-                                     );
-                                 }
-                             }
-                         }
-                         if !forwarded {
-                             // Step 2: no live session claims this datagram. Before
-                             // paying the asymmetric-crypto cost of `respond_message_1`,
-                             // apply the per-source handshake probe rate limiter so an
-                             // attacker flooding garbage UDP cannot force unbounded crypto.
-                             if probe_limiter.allow(from) {
-                                 let is_handshake = self::handle_handshake(
-                                     &server_kp,
-                                     &profile,
-                                     &obf_stack,
-                                     datagram,
-                                     from,
-                                     &peer_auth,
-                                     sock.clone(),
-                                     obf_stack.clone(),
-                                     counters.clone(),
-                                     tun_write_tx.clone(),
-                                     addr_change_tx.clone(),
-                                     &mut sessions,
-                                     &mut addr_index,
-                                     stop_tx.clone(),
-                                     &tun_name,
-                                     tun_mtu,
-                                     fec_config.clone(),
-                                     max_sessions_per_peer,
-                                 ).await;
-                                  if !is_handshake {
-                                      // Step 3: not a handshake either — last
-                                      // resort is the addr_index cache (covers
-                                      // packets whose header cannot be
-                                      // peek-routed, e.g. a whitened frame from a
-                                      // brand-new address before the tunnel has
-                                      // signalled a roam). A stale entry never
-                                      // misroutes: the tunnel's AEAD decrypt
-                                      // rejects foreign bytes.
-                                      if let Some(sid) = addr_fallback(&sessions, &addr_index, from) {
-                                         if let Some(h) = sessions.get_mut(&sid) {
-                                             if h.udp_tx.try_send((datagram.to_vec(), from)).is_ok() {
-                                                 h.last_forwarded = Instant::now();
-                                             } else {
-                                                 tracing::debug!(
-                                                     session_id = sid,
-                                                     from = %from,
-                                                     "addr-index session udp channel full/closed; dropping"
-                                                 );
-                                             }
-                                         }
-                                     }
-                                 }
-                             } else {
-                                 tracing::debug!(
-                                     from = %from,
-                                     "handshake probe rate-limited; dropping datagram"
-                                 );
-                             }
-                         }
+            // Inbound: one event from the carrier listener. A datagram
+            // carrier yields more datagrams from one socket; a stream carrier
+            // yields a new connection, which *is* the session's identity.
+            event = listener.next_event() => {
+                match event {
+                    Ok(Inbound::Datagram { data, from }) => {
+                        dispatch_datagram(
+                            &ctx, &data, from, &mut sessions, &mut addr_index, &mut probe_limiter,
+                        ).await;
+                    }
+                    Ok(Inbound::Connection { carrier, from }) => {
+                        dispatch_connection(
+                            &ctx, carrier, from, &mut sessions, &mut addr_index,
+                        ).await;
                     }
                     Err(e) => {
-                        tracing::warn!(error = ?e, "server udp recv error");
+                        tracing::warn!(error = ?e, carrier = listener.name(), "server carrier accept error");
                     }
                 }
             }
@@ -750,58 +820,53 @@ pub async fn run_server(
 /// fallback / drop path).
 #[allow(clippy::too_many_arguments)]
 async fn handle_handshake(
-    server_kp: &KeyPair,
-    profile: &LocalProfile,
-    obf_stack: &obfuscation::SharedStack,
-    datagram: &[u8],
+    ctx: &ServerCtx,
+    msg1: &[u8],
     from: SocketAddr,
-    peer_auth: &Arc<StdMutex<PeerAuth>>,
-    sock: Arc<UdpSocket>,
-    tunnel_obf_stack: obfuscation::SharedStack,
-    counters: Arc<Mutex<Counters>>,
-    tun_write_tx: mpsc::Sender<(SessionId, Vec<u8>)>,
-    addr_change_tx: mpsc::UnboundedSender<(SessionId, SocketAddr)>,
+    session_carrier: Arc<dyn Carrier>,
     sessions: &mut HashMap<SessionId, ClientHandle>,
     addr_index: &mut HashMap<SocketAddr, SessionId>,
-    stop_tx: watch::Sender<bool>,
-    tun_name: &str,
-    tun_mtu: u32,
-    fec_config: crate::config::FecConfig,
-    max_sessions_per_peer: u8,
 ) -> bool {
-    let auth_guard = peer_auth.lock().unwrap_or_else(|e| e.into_inner());
+    let auth_guard = ctx.peer_auth.lock().unwrap_or_else(|e| e.into_inner());
     let authorizer: Option<Authorizer<'_>> = if auth_guard.is_open_mode() {
         None
     } else {
         Some(&|pk| auth_guard.check(pk))
     };
-    match handshake::respond_message_1(server_kp, profile, obf_stack, datagram, from, authorizer) {
+    match handshake::respond_message_1(
+        &ctx.server_kp,
+        &ctx.profile,
+        &ctx.obf_stack,
+        msg1,
+        from,
+        authorizer,
+    ) {
         Some((established, m2_wire)) => {
-            if let Err(e) = sock.send_to(&m2_wire, from).await {
+            if let Err(e) = session_carrier.send(&m2_wire, from).await {
                 tracing::warn!(
                     error = ?e, peer = %from,
                     "handshake reply send failed; client will not complete handshake"
                 );
-                let mut c = counters.lock().await;
+                let mut c = ctx.counters.lock().await;
                 c.handshake_errors = c.handshake_errors.saturating_add(1);
                 return false;
             }
             // A fresh handshake is always a new session — no replacement of
             // existing sessions by address or static key. The SessionId is
-            // derived from the handshake hash (which includes a fresh ephemeral),
-            // so it is unique per session. If the peer has hit the per-static-key
-            // session cap, evict its oldest-idle session before inserting the new
-            // one (rather than refusing the new handshake, so a legit reconnect
-            // to a fresh NAT port still succeeds).
+            // derived from the handshake hash (which includes a fresh
+            // ephemeral), so it is unique per session. If the peer has hit the
+            // per-static-key session cap, evict its oldest-idle session before
+            // inserting the new one (rather than refusing the new handshake, so
+            // a legit reconnect to a fresh NAT port still succeeds).
             let peer_key_bytes = established.peer_static.to_bytes();
-            evict_oldest_peer_session(sessions, &peer_key_bytes, max_sessions_per_peer);
+            evict_oldest_peer_session(sessions, &peer_key_bytes, ctx.max_sessions_per_peer);
             let label = established.peer_label.clone();
             let peer_static_hex = hex::encode(peer_key_bytes);
             // Seed the per-client obfuscation stack from this session's
             // handshake hash, then hand it to the tunnel. The shared stack
             // configuration is cloned; the clone's keying layers are seeded
             // here so each client's keystream is distinct.
-            let session_stack = tunnel_obf_stack.deref().clone();
+            let session_stack = ctx.obf_stack.deref().clone();
             session_stack.init(&established.handshake_hash);
             // Extract the per-session header_xor keystream (if any) so the
             // dispatcher can de-whiten incoming headers and peek-route without
@@ -809,7 +874,7 @@ async fn handle_handshake(
             // derived from the handshake hash, and the AEAD AAD still
             // authenticates the original header.
             let pub_route_keystream =
-                extract_header_xor_keystream(&established.handshake_hash, &obf_stack);
+                extract_header_xor_keystream(&established.handshake_hash, &ctx.obf_stack);
             // Build this session's runnable profile from the negotiated
             // selection. The congestion controller is per-tunnel state, so a
             // fresh one is created here rather than shared from the server's
@@ -817,8 +882,8 @@ async fn handle_handshake(
             let resolved = match ResolvedProfile::with_handshake_transport(
                 &established.selection,
                 &established.handshake_hash,
-                &*profile.handshake_transport,
-                profile.new_congestion(),
+                &*ctx.profile.handshake_transport,
+                ctx.profile.new_congestion(),
             ) {
                 Ok(p) => p,
                 Err(e) => {
@@ -827,7 +892,7 @@ async fn handle_handshake(
                         error = %e,
                         "negotiated profile cannot be instantiated; dropping client"
                     );
-                    let mut c = counters.lock().await;
+                    let mut c = ctx.counters.lock().await;
                     c.handshake_errors = c.handshake_errors.saturating_add(1);
                     return false;
                 }
@@ -838,19 +903,13 @@ async fn handle_handshake(
                 "session profile instantiated"
             );
             spawn_client(
-                sock,
+                session_carrier,
+                ctx,
                 resolved,
                 session_stack,
                 established,
-                counters.clone(),
-                tun_write_tx,
-                addr_change_tx,
                 sessions,
                 addr_index,
-                stop_tx,
-                tun_name,
-                tun_mtu,
-                fec_config,
                 pub_route_keystream,
             );
             tracing::info!(
@@ -859,7 +918,7 @@ async fn handle_handshake(
                 label = label.as_deref().unwrap_or("unknown"),
                 "handshake accepted; client tunnel spawned"
             );
-            let mut c = counters.lock().await;
+            let mut c = ctx.counters.lock().await;
             c.clients = sessions.len() as u64;
             c.handshakes_accepted = c.handshakes_accepted.saturating_add(1);
             true
@@ -867,8 +926,8 @@ async fn handle_handshake(
         None => {
             // Every handshake outcome (rejected, failed, non-handshake/scan
             // noise) is logged at the appropriate level inside
-            // `respond_message_1`; nothing to do here but drop the datagram.
-            let mut c = counters.lock().await;
+            // `respond_message_1`; nothing to do here but drop the message.
+            let mut c = ctx.counters.lock().await;
             c.handshakes_rejected = c.handshakes_rejected.saturating_add(1);
             false
         }
@@ -876,23 +935,23 @@ async fn handle_handshake(
 }
 
 /// Spawn a per-client tunnel task and register it in the session table.
-#[allow(clippy::too_many_arguments)]
 fn spawn_client(
-    sock: Arc<UdpSocket>,
+    carrier: Arc<dyn Carrier>,
+    ctx: &ServerCtx,
     profile: ResolvedProfile,
     obfuscation: ObfuscationStack,
     established: handshake::SessionEstablished,
-    counters: Arc<Mutex<Counters>>,
-    tun_write_tx: mpsc::Sender<(SessionId, Vec<u8>)>,
-    addr_change_tx: mpsc::UnboundedSender<(SessionId, SocketAddr)>,
     sessions: &mut HashMap<SessionId, ClientHandle>,
     addr_index: &mut HashMap<SocketAddr, SessionId>,
-    stop_tx: watch::Sender<bool>,
-    tun_name: &str,
-    tun_mtu: u32,
-    fec_config: crate::config::FecConfig,
     pub_route_keystream: Option<[u8; HEADER_LEN]>,
 ) {
+    let counters = ctx.counters.clone();
+    let tun_write_tx = ctx.tun_write_tx.clone();
+    let addr_change_tx = ctx.addr_change_tx.clone();
+    let stop_tx = ctx.stop_tx.clone();
+    let tun_name = ctx.tun_name.as_str();
+    let tun_mtu = ctx.tun_mtu;
+    let fec_config = ctx.fec_config.clone();
     let peer = established.peer;
     let session = Session::new(established.session_id, SessionRole::Responder);
     let session_id = established.session_id;
@@ -912,7 +971,7 @@ fn spawn_client(
 
     let mut tunnel = match Tunnel::from_handshake(
         channel_tun,
-        sock,
+        carrier,
         peer,
         session,
         profile,

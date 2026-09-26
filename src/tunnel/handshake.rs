@@ -30,11 +30,11 @@
 //! tunnel, so an incompatible server fails the handshake with a readable error
 //! rather than producing a session whose every packet fails to authenticate.
 
+use crate::carrier::Carrier;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 use crate::crypto::keys::{KeyPair, PublicKey};
@@ -75,7 +75,7 @@ pub type Authorizer<'a> = &'a dyn Fn(&PublicKey) -> (bool, Option<String>);
 /// keystream is not derived until [`super::Tunnel::from_handshake`] calls
 /// `init` with the handshake hash.
 pub async fn client(
-    sock: Arc<UdpSocket>,
+    carrier: Arc<dyn Carrier>,
     server: SocketAddr,
     client_kp: &KeyPair,
     server_pub: PublicKey,
@@ -100,17 +100,18 @@ pub async fn client(
         let obf = obfuscation.apply(&m1);
         let wire = transport.wrap(&obf);
         tracing::trace!(attempt, len = wire.len(), "sending msg1");
-        sock.send_to(&wire, server).await?;
+        carrier.send(&wire, server).await?;
 
-        // Wait for message 2.
-        let mut buf = vec![0u8; 65535];
-        match timeout(HANDSHAKE_RTO, sock.recv_from(&mut buf)).await {
-            Ok(Ok((n, from))) => {
+        // Wait for message 2. The carrier guarantees one whole message per
+        // `recv`, so the length is whatever the carrier reports rather than a
+        // buffer we sized ourselves.
+        match timeout(HANDSHAKE_RTO, carrier.recv()).await {
+            Ok(Ok((msg2, from))) => {
                 if from != server {
                     tracing::trace!(from = %from, "ignoring msg2 from wrong address");
                     continue;
                 }
-                let unwrapped = match transport.unwrap(&buf[..n]) {
+                let unwrapped = match transport.unwrap(&msg2) {
                     Ok(u) => u,
                     Err(_) => {
                         tracing::trace!(attempt, "transport unwrap failed for msg2; retrying");
@@ -346,18 +347,17 @@ pub fn respond_message_1(
 /// [`super::server::run_server`] which calls [`respond_message_1`] per
 /// datagram instead.
 pub async fn server(
-    sock: Arc<UdpSocket>,
+    carrier: Arc<dyn Carrier>,
     server_kp: KeyPair,
     profile: LocalProfile,
     obfuscation: &ObfuscationStack,
 ) -> Result<SessionEstablished, HandshakeError> {
-    let mut buf = vec![0u8; 65535];
     loop {
-        let (n, from) = sock.recv_from(&mut buf).await?;
+        let (msg1, from) = carrier.recv().await?;
         if let Some((established, m2_wire)) =
-            respond_message_1(&server_kp, &profile, obfuscation, &buf[..n], from, None)
+            respond_message_1(&server_kp, &profile, obfuscation, &msg1, from, None)
         {
-            sock.send_to(&m2_wire, from).await?;
+            carrier.send(&m2_wire, from).await?;
             return Ok(established);
         }
     }
@@ -389,12 +389,14 @@ pub enum HandshakeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::carrier::UdpCarrier;
     use crate::crypto::keys::{KeyPair, StaticSecret};
     use crate::obfuscation::ObfuscationStack;
     use crate::protocol::profile::ResolvedProfile;
     use crate::protocol::profile::{ClientOffer, ProfilePrefs, Selection};
     use crate::protocol::session::session_id_from_hash;
     use crate::transport::PlainTransport;
+    use tokio::net::UdpSocket;
 
     fn fixed_kp(secret: [u8; 32]) -> KeyPair {
         let s = StaticSecret::from(secret);
@@ -504,6 +506,8 @@ mod tests {
     ) {
         let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let server_addr = server_sock.local_addr().unwrap();
+        let server_carrier: Arc<dyn crate::carrier::Carrier> =
+            Arc::new(UdpCarrier::new(server_sock.clone(), server_addr));
         let server_kp = fixed_kp([0x22; 32]);
         let client_kp = fixed_kp([0x11; 32]);
         let obf = ObfuscationStack::new();
@@ -512,14 +516,17 @@ mod tests {
             let server_kp = clone_keypair(&server_kp);
             let obf = ObfuscationStack::new();
             async move {
-                server(server_sock, server_kp, server_profile, &obf)
+                server(server_carrier, server_kp, server_profile, &obf)
                     .await
                     .map_err(|e| e.to_string())
             }
         });
 
         let server_pub = server_kp.public;
-        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_sock: Arc<dyn crate::carrier::Carrier> = Arc::new(UdpCarrier::new(
+            Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            server_addr,
+        ));
         let client = client(
             client_sock,
             server_addr,

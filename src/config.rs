@@ -130,6 +130,42 @@ pub struct ObfuscationConfig {
 // `[transport] handshake`. A mismatch there is detected and reported at
 // handshake time, not negotiated away.
 
+/// The `[carrier]` section: what the protocol's bytes travel over.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CarrierConfig {
+    /// The byte carrier. `"udp"` (default) is a datagram socket;
+    /// `"tcp"` is a length-delimited stream.
+    ///
+    /// This is **config-pinned, not negotiated**, and it is the one part that
+    /// cannot be: the negotiation itself travels over the carrier, so there is
+    /// no channel left to agree on it. Both peers must name the same carrier.
+    ///
+    /// A mismatch is reported rather than left to time out. The client
+    /// advertises its carrier in the message-1 offer (see
+    /// `HandshakeConfig::propose`) and the server compares it, so a
+    /// `[handshake] propose = true` fleet gets an explicit "carrier mismatch"
+    /// error instead of a silent handshake timeout. Without `propose` a
+    /// mismatch can only surface as a failed handshake.
+    ///
+    /// An unknown name is a **hard error**: there is no safe fallback, since
+    /// the alternative is a server that listens on UDP while its clients dial
+    /// TCP and nothing ever connects.
+    #[serde(default = "default_carrier")]
+    pub name: String,
+}
+
+impl Default for CarrierConfig {
+    fn default() -> Self {
+        Self {
+            name: default_carrier(),
+        }
+    }
+}
+
+fn default_carrier() -> String {
+    "udp".to_string()
+}
+
 /// The `[handshake]` section: key exchange and profile negotiation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HandshakeConfig {
@@ -302,6 +338,8 @@ pub struct ServerConfig {
     pub obfuscation: Option<ObfuscationConfig>,
     /// Resolved FEC (forward error correction) configuration.
     pub fec: FecConfig,
+    /// Resolved `[carrier]` configuration (byte carrier name).
+    pub carrier: CarrierConfig,
     /// Resolved `[handshake]` configuration (KEX name + whether to propose).
     pub handshake: HandshakeConfig,
     /// Resolved `[crypto]` configuration (AEAD suite preference).
@@ -340,6 +378,7 @@ impl Default for ServerConfig {
             log_file: None,
             obfuscation: None,
             fec: FecConfig::default(),
+            carrier: CarrierConfig::default(),
             handshake: HandshakeConfig::default(),
             crypto: CryptoConfig::default(),
             transport: TransportConfig::default(),
@@ -432,6 +471,8 @@ pub struct ClientConfig {
     pub obfuscation: Option<ObfuscationConfig>,
     /// Resolved FEC (forward error correction) configuration.
     pub fec: FecConfig,
+    /// Resolved `[carrier]` configuration (byte carrier name).
+    pub carrier: CarrierConfig,
     /// Resolved `[handshake]` configuration (KEX name + whether to propose).
     pub handshake: HandshakeConfig,
     /// Resolved `[crypto]` configuration (AEAD suite preference).
@@ -467,6 +508,7 @@ impl Default for ClientConfig {
             log_file: None,
             obfuscation: None,
             fec: FecConfig::default(),
+            carrier: CarrierConfig::default(),
             handshake: HandshakeConfig::default(),
             crypto: CryptoConfig::default(),
             transport: TransportConfig::default(),
@@ -573,6 +615,12 @@ const FEC_SCHEMA: SectionSchema = SectionSchema {
     array_tables: &[],
 };
 
+const CARRIER_SCHEMA: SectionSchema = SectionSchema {
+    scalars: &["name"],
+    tables: &[],
+    array_tables: &[],
+};
+
 const HANDSHAKE_SCHEMA: SectionSchema = SectionSchema {
     scalars: &["kex", "propose"],
     tables: &[],
@@ -611,6 +659,7 @@ const SERVER_SCHEMA: SectionSchema = SectionSchema {
         ("nat", &NAT_SCHEMA),
         ("obfuscation", &OBFUSCATION_SCHEMA),
         ("fec", &FEC_SCHEMA),
+        ("carrier", &CARRIER_SCHEMA),
         ("handshake", &HANDSHAKE_SCHEMA),
         ("crypto", &CRYPTO_SCHEMA),
         ("transport", &TRANSPORT_SCHEMA),
@@ -639,6 +688,7 @@ const CLIENT_SCHEMA: SectionSchema = SectionSchema {
         ("nat", &CLIENT_NAT_SCHEMA),
         ("obfuscation", &OBFUSCATION_SCHEMA),
         ("fec", &FEC_SCHEMA),
+        ("carrier", &CARRIER_SCHEMA),
         ("handshake", &HANDSHAKE_SCHEMA),
         ("crypto", &CRYPTO_SCHEMA),
         ("transport", &TRANSPORT_SCHEMA),
@@ -844,6 +894,9 @@ pub struct ServerFileConfig {
     /// `[fec]` section. `None` (no section) leaves FEC at defaults.
     #[serde(default)]
     pub fec: Option<FecSection>,
+    /// `[carrier]` section. `None` leaves the byte carrier at its default.
+    #[serde(default)]
+    pub carrier: Option<CarrierConfig>,
     /// `[handshake]` section. `None` leaves the KEX and negotiation at defaults.
     #[serde(default)]
     pub handshake: Option<HandshakeConfig>,
@@ -926,6 +979,9 @@ pub struct ClientFileConfig {
     /// `[fec]` section. `None` (no section) leaves FEC at defaults.
     #[serde(default)]
     pub fec: Option<FecSection>,
+    /// `[carrier]` section. `None` leaves the byte carrier at its default.
+    #[serde(default)]
+    pub carrier: Option<CarrierConfig>,
     /// `[handshake]` section. `None` leaves the KEX and negotiation at defaults.
     #[serde(default)]
     pub handshake: Option<HandshakeConfig>,
@@ -1048,6 +1104,9 @@ pub fn merge_server_config(
         if let Some(x) = v.initial_m {
             base.fec.initial_m = x;
         }
+    }
+    if let Some(v) = file.carrier {
+        base.carrier = v;
     }
     if let Some(v) = file.handshake {
         base.handshake = v;
@@ -1198,6 +1257,9 @@ pub fn merge_client_config(
         if let Some(x) = v.initial_m {
             base.fec.initial_m = x;
         }
+    }
+    if let Some(v) = file.carrier {
+        base.carrier = v;
     }
     if let Some(v) = file.handshake {
         base.handshake = v;
