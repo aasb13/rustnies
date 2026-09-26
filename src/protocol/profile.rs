@@ -1058,6 +1058,7 @@ mod tests {
     use crate::fec::{DEFAULT_FEC_SCHEME, FEC_NONE, FEC_NONE_ID, FEC_REED_SOLOMON};
     use crate::transport::{
         DEFAULT_TAG, TRANSPORT_PLAIN, TRANSPORT_SAME_AS_HANDSHAKE, TRANSPORT_TAGGED,
+        default_transport,
     };
 
     fn prefs(ciphers: &[&str], transports: &[&str], fecs: &[&str]) -> ProfilePrefs {
@@ -1091,6 +1092,78 @@ mod tests {
             fec_ids: fecs.to_vec(),
             frame_ids: frames.to_vec(),
         }
+    }
+
+    /// The genuine rejection case: a client offering a codec id this build does
+    /// not implement. That is the only way the frame part can fail to
+    /// negotiate, since a peer can only offer ids from its own registry -- which
+    /// is what a mixed-version fleet actually produces.
+    #[test]
+    fn an_offer_naming_an_unknown_codec_is_rejected_outright() {
+        let prefs = prefs_with_frames(&[], &[], &[], &["v1-fixed"]);
+        let offer = offer_with_frames(&[], &[], &[], &[200, 201]); // ids nothing implements
+        let err = negotiate(&prefs, Some(&offer), DEFAULT_TAG).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ProfileError::NoCommonPart {
+                    part: PART_FRAME,
+                    ..
+                }
+            ),
+            "expected a frame NoCommonPart, got {err:?}"
+        );
+    }
+
+    /// Every codec the registry knows must be negotiable, and a selection
+    /// naming any of them must pass `check`. Otherwise a peer could be told to
+    /// run a codec this build cannot build.
+    #[test]
+    fn every_known_codec_id_negotiates_and_validates() {
+        for (name, id) in [
+            ("v1-fixed", frame_codec::FRAME_V1_FIXED),
+            ("v2-tlv", frame_codec::FRAME_V2_TLV),
+        ] {
+            let prefs = prefs_with_frames(&[], &[], &[], &[name]);
+            let offer = offer_with_frames(&[], &[], &[], &[id]);
+            let sel = negotiate(&prefs, Some(&offer), DEFAULT_TAG)
+                .unwrap_or_else(|e| panic!("{name} must negotiate: {e}"));
+            assert_eq!(sel.frame, id);
+            sel.check()
+                .unwrap_or_else(|e| panic!("{name} must pass check: {e}"));
+            let built = ResolvedProfile::with_handshake_transport(
+                &sel,
+                &[0u8; 32],
+                &*default_transport(),
+                build_congestion(DEFAULT_CONGESTION).unwrap(),
+            );
+            assert!(
+                built.is_ok(),
+                "{name} must be instantiable: {:?}",
+                built.err()
+            );
+            assert_eq!(
+                built.unwrap().codec.name(),
+                name,
+                "the built codec must match"
+            );
+        }
+    }
+
+    /// A server's *preference order* is a preference, not a constraint: if the
+    /// client offers only something else that this build can run, the fallback
+    /// picks it. Pinned because it surprises operators who expect their server
+    /// config to be binding.
+    #[test]
+    fn a_server_preference_does_not_override_a_buildable_client_offer() {
+        let prefs = prefs_with_frames(&[], &[], &[], &["v1-fixed"]);
+        let offer = offer_with_frames(&[], &[], &[], &[frame_codec::FRAME_V2_TLV]);
+        let sel = negotiate(&prefs, Some(&offer), DEFAULT_TAG).unwrap();
+        assert_eq!(
+            sel.frame,
+            frame_codec::FRAME_V2_TLV,
+            "the client's only buildable option wins over the server's list"
+        );
     }
 
     // ---- Preference resolution ----

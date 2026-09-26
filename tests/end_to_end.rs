@@ -2309,3 +2309,439 @@ async fn a_full_mtu_packet_survives_tcp_stream_framing() {
     c_reader.abort();
     s_reader.abort();
 }
+
+// ---------------------------------------------------------------------------
+// Frame codec: a full session over the v2-tlv header layout
+// ---------------------------------------------------------------------------
+
+/// A profile that asks for the TLV codec, with everything else at defaults.
+fn tlv_profile() -> LocalProfile {
+    LocalProfile::from_role_config(
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &rustnies::config::FrameConfig {
+            codec: vec!["v2-tlv".into()],
+        },
+    )
+    .expect("the v2-tlv profile must resolve")
+}
+
+/// A full session — handshake, tunnels, data both ways — over the TLV header.
+///
+/// This is the test that would fail if any path still assumed the v1 layout:
+/// the header is built, authenticated, framed, parsed and routed through
+/// `V2TlvCodec` alone, and nothing in the tunnel knows which codec is in use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_flows_over_the_v2_tlv_header_layout() {
+    let (server_stream, client_stream) = tcp_pair();
+    let server_addr = server_stream.local_addr().unwrap();
+    let client_addr = client_stream.local_addr().unwrap();
+    let server_carrier: Arc<dyn Carrier> =
+        Arc::new(TcpCarrier::new(server_stream, client_addr).unwrap());
+    let client_carrier: Arc<dyn Carrier> =
+        Arc::new(TcpCarrier::new(client_stream, server_addr).unwrap());
+
+    let server_kp = KeyPair::generate();
+    let client_kp = KeyPair::generate();
+    // Built twice rather than cloned: `LocalProfile` holds boxed parts, so it
+    // is deliberately not `Clone`.
+    let server_profile = tlv_profile();
+
+    // The client must propose, or the server has no idea it can do TLV and will
+    // pick its own first preference (v1-fixed).
+    let client_profile = LocalProfile::from_role_config(
+        &rustnies::config::HandshakeConfig {
+            kex: "noise-ik".into(),
+            propose: true,
+        },
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &rustnies::config::FrameConfig {
+            codec: vec!["v2-tlv".into()],
+        },
+    )
+    .unwrap();
+
+    let server_handle = {
+        let kp = clone_keypair(&server_kp);
+        let carrier = server_carrier.clone();
+        let profile = tlv_profile();
+        tokio::spawn(async move {
+            handshake::server(carrier, kp, profile, &ObfuscationStack::new())
+                .await
+                .expect("server handshake failed over tlv")
+        })
+    };
+    let established_client = tokio::time::timeout(
+        Duration::from_secs(5),
+        handshake::client(
+            client_carrier.clone(),
+            server_addr,
+            &client_kp,
+            server_kp.public,
+            &client_profile,
+            &ObfuscationStack::new(),
+        ),
+    )
+    .await
+    .expect("client handshake timed out over tlv")
+    .expect("client handshake failed over tlv");
+    let established_server = tokio::time::timeout(Duration::from_secs(5), server_handle)
+        .await
+        .expect("server join timed out")
+        .expect("server task panicked");
+
+    // The negotiation must actually have selected TLV, not silently fallen back.
+    assert_eq!(
+        established_client.selection.frame,
+        rustnies::protocol::frame::FRAME_V2_TLV,
+        "the negotiated codec must be v2-tlv on the client"
+    );
+    assert_eq!(
+        established_server.selection.frame,
+        rustnies::protocol::frame::FRAME_V2_TLV,
+        "the negotiated codec must be v2-tlv on the server"
+    );
+    assert_eq!(established_client.send_key, established_server.recv_key);
+    assert_eq!(established_client.session_id, established_server.session_id);
+
+    // Both ends must have built the same codec from that selection.
+    let cp = resolved_profile(&client_profile, &established_client);
+    let sp = resolved_profile(&server_profile, &established_server);
+    assert_eq!(cp.codec.name(), "v2-tlv");
+    assert_eq!(sp.codec.name(), "v2-tlv");
+
+    // FEC off so a frame is exactly one packet: no parity to confuse a count.
+    let (client_tun, client_inject, _client_rx) = MemTun::pair("rustnies0", 1400);
+    let (server_tun, _server_inject, mut server_rx) = MemTun::pair("rustnies", 1400);
+
+    let mut client_tunnel = Tunnel::from_handshake(
+        client_tun,
+        client_carrier.clone(),
+        established_client.peer,
+        Session::new(established_client.session_id, SessionRole::Initiator),
+        ResolvedProfile {
+            fec: Box::new(rustnies::fec::NoFec),
+            ..cp
+        },
+        ObfuscationStack::new(),
+        established_client.send_key,
+        established_client.recv_key,
+        established_client.send_dir,
+        established_client.recv_dir,
+        Arc::new(Mutex::new(Counters::new())),
+    )
+    .unwrap();
+    let mut server_tunnel = Tunnel::from_handshake(
+        server_tun,
+        server_carrier.clone(),
+        established_server.peer,
+        Session::new(established_server.session_id, SessionRole::Responder),
+        ResolvedProfile {
+            fec: Box::new(rustnies::fec::NoFec),
+            ..sp
+        },
+        ObfuscationStack::new(),
+        established_server.send_key,
+        established_server.recv_key,
+        established_server.send_dir,
+        established_server.recv_dir,
+        Arc::new(Mutex::new(Counters::new())),
+    )
+    .unwrap();
+
+    let (c_tx, c_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1024);
+    let (s_tx, s_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1024);
+    let c_reader = tokio::spawn(carrier_reader(client_carrier.clone(), c_tx));
+    let s_reader = tokio::spawn(carrier_reader(server_carrier.clone(), s_tx));
+    let (_c_stop, c_stop_rx) = watch::channel(false);
+    let (_s_stop, s_stop_rx) = watch::channel(false);
+    let c_run = tokio::spawn(async move { client_tunnel.run(c_stop_rx, c_rx).await });
+    let s_run = tokio::spawn(async move { server_tunnel.run(s_stop_rx, s_rx).await });
+
+    // A max-size packet, so the TLV header's variable length is exercised at
+    // the end of the MTU budget rather than only on small frames.
+    let mut big = vec![0u8; 1360];
+    big[0] = 0x45;
+    big[2..4].copy_from_slice(&1360u16.to_be_bytes());
+    for (i, b) in big.iter_mut().enumerate().skip(20) {
+        *b = (i % 251) as u8;
+    }
+    client_inject.send(big.clone()).unwrap();
+
+    let got = tokio::time::timeout(Duration::from_secs(5), server_rx.recv())
+        .await
+        .expect("no packet arrived over the tlv codec")
+        .expect("tun channel closed");
+    assert_eq!(got, big, "packet must survive the tlv framing intact");
+
+    c_run.abort();
+    s_run.abort();
+    c_reader.abort();
+    s_reader.abort();
+}
+
+/// A server that only speaks v1-fixed must still serve a proposing client that
+/// offers both — this is the mixed-fleet case the negotiation exists for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v1_only_server_answers_a_proposing_client_with_v1_fixed() {
+    let (server_stream, client_stream) = tcp_pair();
+    let server_addr = server_stream.local_addr().unwrap();
+    let client_addr = client_stream.local_addr().unwrap();
+    let server_carrier: Arc<dyn Carrier> =
+        Arc::new(TcpCarrier::new(server_stream, client_addr).unwrap());
+    let client_carrier: Arc<dyn Carrier> =
+        Arc::new(TcpCarrier::new(client_stream, server_addr).unwrap());
+
+    let server_kp = KeyPair::generate();
+    let client_kp = KeyPair::generate();
+
+    // Server: v1-fixed only, no propose (it has nothing to negotiate).
+    let server_profile = LocalProfile::from_role_config(
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &rustnies::config::FrameConfig {
+            codec: vec!["v1-fixed".into()],
+        },
+    )
+    .unwrap();
+
+    // Client: prefers TLV, falls back to v1-fixed, and proposes.
+    let client_profile = LocalProfile::from_role_config(
+        &rustnies::config::HandshakeConfig {
+            kex: "noise-ik".into(),
+            propose: true,
+        },
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &rustnies::config::FrameConfig {
+            codec: vec!["v2-tlv".into(), "v1-fixed".into()],
+        },
+    )
+    .unwrap();
+
+    let server_handle = {
+        let kp = clone_keypair(&server_kp);
+        let carrier = server_carrier.clone();
+        let profile = LocalProfile::from_role_config(
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &rustnies::config::FrameConfig {
+                codec: vec!["v1-fixed".into()],
+            },
+        )
+        .unwrap();
+        tokio::spawn(async move {
+            handshake::server(carrier, kp, profile, &ObfuscationStack::new())
+                .await
+                .expect("server handshake failed")
+        })
+    };
+    let established_client = tokio::time::timeout(
+        Duration::from_secs(5),
+        handshake::client(
+            client_carrier,
+            server_addr,
+            &client_kp,
+            server_kp.public,
+            &client_profile,
+            &ObfuscationStack::new(),
+        ),
+    )
+    .await
+    .expect("client handshake timed out")
+    .expect("client handshake failed");
+    tokio::time::timeout(Duration::from_secs(5), server_handle)
+        .await
+        .expect("server join timed out")
+        .expect("server task panicked");
+
+    // The server could not run TLV, so it must have picked the client's
+    // fallback rather than failing or choosing something unrunnable.
+    assert_eq!(
+        established_client.selection.frame,
+        rustnies::protocol::frame::FRAME_V1_FIXED,
+        "a v1-only server must fall back to the client's v1-fixed offer"
+    );
+    let p = resolved_profile(&client_profile, &established_client);
+    assert_eq!(p.codec.name(), "v1-fixed");
+    assert_eq!(p.codec.wire_id(), rustnies::protocol::frame::FRAME_V1_FIXED);
+}
+
+/// A server configured v1-first will still serve a TLV-only client, because the
+/// fallback step asks "can this *build* run it", not "is it in my preference
+/// list".
+///
+/// This is worth pinning because it surprises operators: a server's configured
+/// order is a preference, not a hard constraint. Only a client offering an id
+/// no build implements causes a rejection (see the profile unit tests), because
+/// a build can only offer ids from its own registry. If a deployment needs
+/// v1-only to be enforced, that is a firewall rule, not a config preference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tlv_only_client_is_served_even_by_a_v1_configured_server() {
+    let (server_stream, client_stream) = tcp_pair();
+    let server_addr = server_stream.local_addr().unwrap();
+    let client_addr = client_stream.local_addr().unwrap();
+    let server_carrier: Arc<dyn Carrier> =
+        Arc::new(TcpCarrier::new(server_stream, client_addr).unwrap());
+    let client_carrier: Arc<dyn Carrier> =
+        Arc::new(TcpCarrier::new(client_stream, server_addr).unwrap());
+
+    let server_kp = KeyPair::generate();
+    let client_kp = KeyPair::generate();
+    let v1_only = || {
+        LocalProfile::from_role_config(
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &rustnies::config::FrameConfig {
+                codec: vec!["v1-fixed".into()],
+            },
+        )
+        .unwrap()
+    };
+    let client_profile = LocalProfile::from_role_config(
+        &rustnies::config::HandshakeConfig {
+            kex: "noise-ik".into(),
+            propose: true,
+        },
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &rustnies::config::FrameConfig {
+            codec: vec!["v2-tlv".into()],
+        },
+    )
+    .unwrap();
+
+    let server_handle = {
+        let kp = clone_keypair(&server_kp);
+        let carrier = server_carrier.clone();
+        tokio::spawn(async move {
+            handshake::server(carrier, kp, v1_only(), &ObfuscationStack::new())
+                .await
+                .expect("server handshake failed")
+        })
+    };
+    let established_client = tokio::time::timeout(
+        Duration::from_secs(5),
+        handshake::client(
+            client_carrier,
+            server_addr,
+            &client_kp,
+            server_kp.public,
+            &client_profile,
+            &ObfuscationStack::new(),
+        ),
+    )
+    .await
+    .expect("client handshake timed out")
+    .expect("client handshake failed");
+    tokio::time::timeout(Duration::from_secs(5), server_handle)
+        .await
+        .expect("server join timed out")
+        .expect("server task panicked");
+
+    // The client's only option wins via the fallback, because this build can
+    // run it -- even though the server's own list did not include it.
+    assert_eq!(
+        established_client.selection.frame,
+        rustnies::protocol::frame::FRAME_V2_TLV,
+        "a buildable client-offered codec wins even if the server did not list it"
+    );
+}
+
+/// A v1-only client (no offer) against a TLV-capable server must land on v1.
+///
+/// This is the pre-seam path: with no offer the server picks its own first
+/// preference, and the client decodes whatever it is told. If the server is
+/// configured TLV-first, an old client would get TLV — so the documented
+/// deployment rule is that a server's first preference must be the one every
+/// un-offering peer can run. Pinning it here so the rule has a test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_proposing_client_gets_the_servers_first_codec() {
+    let (server_stream, client_stream) = tcp_pair();
+    let server_addr = server_stream.local_addr().unwrap();
+    let client_addr = client_stream.local_addr().unwrap();
+    let server_carrier: Arc<dyn Carrier> =
+        Arc::new(TcpCarrier::new(server_stream, client_addr).unwrap());
+    let client_carrier: Arc<dyn Carrier> =
+        Arc::new(TcpCarrier::new(client_stream, server_addr).unwrap());
+
+    let server_kp = KeyPair::generate();
+    let client_kp = KeyPair::generate();
+    let server_profile = LocalProfile::from_role_config(
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &rustnies::config::FrameConfig {
+            codec: vec!["v1-fixed".into(), "v2-tlv".into()],
+        },
+    )
+    .unwrap();
+
+    let server_handle = {
+        let kp = clone_keypair(&server_kp);
+        let carrier = server_carrier.clone();
+        let profile = LocalProfile::from_role_config(
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &rustnies::config::FrameConfig {
+                codec: vec!["v1-fixed".into()],
+            },
+        )
+        .unwrap();
+        tokio::spawn(async move {
+            handshake::server(carrier, kp, profile, &ObfuscationStack::new())
+                .await
+                .expect("server handshake failed")
+        })
+    };
+    // Default profile: propose = false, so no offer is sent.
+    let client_profile = default_profile();
+    let established_client = tokio::time::timeout(
+        Duration::from_secs(5),
+        handshake::client(
+            client_carrier,
+            server_addr,
+            &client_kp,
+            server_kp.public,
+            &client_profile,
+            &ObfuscationStack::new(),
+        ),
+    )
+    .await
+    .expect("client handshake timed out")
+    .expect("client handshake failed");
+    tokio::time::timeout(Duration::from_secs(5), server_handle)
+        .await
+        .expect("server join timed out")
+        .expect("server task panicked");
+
+    assert_eq!(
+        established_client.selection.frame,
+        rustnies::protocol::frame::FRAME_V1_FIXED,
+        "with no offer, the server's first preference wins"
+    );
+}
