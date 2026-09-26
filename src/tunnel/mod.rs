@@ -26,7 +26,6 @@ use crate::crypto::aead::Direction;
 use crate::fec::adaptive::{AdaptiveFec, FecParams};
 use crate::obfuscation::{ObfuscationStack, is_decoy_frame};
 use crate::protocol::SessionId;
-use crate::protocol::codec;
 use crate::protocol::header::{MAX_PAYLOAD, OUTER_OVERHEAD, PATH_MTU, PacketHeader, PacketType};
 use crate::protocol::profile::ResolvedProfile;
 use crate::protocol::session::Session;
@@ -782,11 +781,14 @@ impl Tunnel {
             .profile
             .cipher
             .make_nonce(self.session.id, seq, self.send_dir);
-        let hdr_bytes = hdr.to_bytes();
+        // AAD and the frame's header are the same bytes: this codec's encoding
+        // of `hdr`. The sender authenticates exactly what it will transmit.
+        let codec = &*self.profile.codec;
+        let aad = codec.encode_header(&hdr);
         let ciphertext = match self
             .profile
             .cipher
-            .seal(&self.send_key, &nonce, &hdr_bytes, &packet)
+            .seal(&self.send_key, &nonce, &aad, &packet)
         {
             Ok(ct) => ct,
             Err(e) => {
@@ -795,7 +797,7 @@ impl Tunnel {
                 return false;
             }
         };
-        let frame = codec::encode_raw(&hdr, &ciphertext);
+        let frame = codec.encode_frame(&hdr, &ciphertext);
         let wire = self.wrap_frame(&frame);
         // Post-transform guard: a custom obfuscation/transport stack (e.g. an
         // oversized padding bucket) can inflate the datagram past the path
@@ -915,7 +917,8 @@ impl Tunnel {
                         .profile
                         .cipher
                         .make_nonce(self.session.id, seq, self.send_dir);
-                    let hdr_bytes = hdr.to_bytes();
+                    let codec = &*self.profile.codec;
+                    let hdr_bytes = codec.encode_header(&hdr);
                     let ct =
                         match self
                             .profile
@@ -929,7 +932,7 @@ impl Tunnel {
                                 continue;
                             }
                         };
-                    let frame = codec::encode_raw(&hdr, &ct);
+                    let frame = codec.encode_frame(&hdr, &ct);
                     let wire = self.wrap_frame(&frame);
                     if wire.len() + OUTER_OVERHEAD > PATH_MTU {
                         tracing::debug!(
@@ -1027,7 +1030,8 @@ impl Tunnel {
             .profile
             .cipher
             .make_nonce(self.session.id, seq, self.send_dir);
-        let hdr_bytes = hdr.to_bytes();
+        let codec = &*self.profile.codec;
+        let hdr_bytes = codec.encode_header(&hdr);
         let ct = match self
             .profile
             .cipher
@@ -1039,7 +1043,7 @@ impl Tunnel {
                 return;
             }
         };
-        let frame = codec::encode_raw(&hdr, &ct);
+        let frame = codec.encode_frame(&hdr, &ct);
         let wire = self.wrap_frame(&frame);
         tracing::trace!(ptype = ?ptype, seq, len = payload.len(), "send packet");
         if let Err(e) = self.carrier.send(&wire, self.peer).await {
@@ -1066,7 +1070,8 @@ impl Tunnel {
             .profile
             .cipher
             .make_nonce(self.session.id, seq, self.send_dir);
-        let hdr_bytes = hdr.to_bytes();
+        let codec = &*self.profile.codec;
+        let hdr_bytes = codec.encode_header(&hdr);
         let ct = self
             .profile
             .cipher
@@ -1075,7 +1080,7 @@ impl Tunnel {
                 tracing::error!(error = ?e, seq, "reliable control encrypt failed");
                 io::Error::new(io::ErrorKind::Other, e.to_string())
             })?;
-        let frame = codec::encode_raw(&hdr, &ct);
+        let frame = codec.encode_frame(&hdr, &ct);
         let wire = self.wrap_frame(&frame);
         self.carrier.send(&wire, self.peer).await?;
         if self.outstanding.len() < MAX_OUTSTANDING_CONTROL {
@@ -1212,15 +1217,21 @@ impl Tunnel {
             tracing::trace!(len = frame.len(), "dropping decoy frame");
             return Ok(());
         }
-        let pkt =
-            codec::decode(&frame).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let hdr = pkt.header;
+        let codec = &self.profile.codec;
+        let hdr = codec
+            .read_header(&frame)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // The body starts wherever this codec's header ended, which for a
+        // fixed-layout codec is `max_header_len()` and for a variable-length
+        // one is wherever the header said. `body_offset` is the codec's answer
+        // for the frame just parsed.
+        let body = frame[codec.body_offset(&frame).min(frame.len())..].to_vec();
 
         tracing::trace!(
             ptype = ?hdr.packet_type,
             seq = hdr.seq,
             ack_seq = hdr.ack_seq,
-            len = pkt.body.len(),
+            len = body.len(),
             "recv packet"
         );
 
@@ -1229,19 +1240,24 @@ impl Tunnel {
             .profile
             .cipher
             .make_nonce(self.session.id, hdr.seq, self.recv_dir);
-        let hdr_bytes = hdr.to_bytes();
-        let plaintext =
-            match self
-                .profile
-                .cipher
-                .open(&self.recv_key, &nonce, &hdr_bytes, &pkt.body)
-            {
-                Ok(p) => p,
-                Err(_) => {
-                    tracing::debug!(seq = hdr.seq, "decrypt failed; dropping");
-                    return Ok(());
-                }
-            };
+        // AAD is the header as *this* codec encodes it, which is what the
+        // sender authenticated. Re-encoding must be exact, so a codec whose
+        // encode/decode is not round-trip-stable would fail here.
+        let mut aad = bytes::BytesMut::new();
+        codec
+            .write_header(&hdr, &mut aad)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let plaintext = match self
+            .profile
+            .cipher
+            .open(&self.recv_key, &nonce, &aad, &body)
+        {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::debug!(seq = hdr.seq, "decrypt failed; dropping");
+                return Ok(());
+            }
+        };
 
         if hdr.ack_seq != self.last_peer_ack || hdr.ack_bitmap != self.last_peer_bitmap {
             self.session.observe_acks(hdr.ack_seq, hdr.ack_bitmap);
@@ -1615,6 +1631,7 @@ mod tests {
     use crate::crypto::aead::Direction;
     use crate::crypto::suite::AeadCipher;
     use crate::fec::{ReedSolomon, ReedSolomonScheme};
+    use crate::protocol::codec;
     use crate::protocol::profile::Selection;
     use crate::protocol::session::{Session, SessionRole};
     use crate::tun::{Tun, TunFut};

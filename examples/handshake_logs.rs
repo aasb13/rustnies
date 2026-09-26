@@ -24,6 +24,7 @@ fn default_profile() -> LocalProfile {
         &Default::default(),
         &Default::default(),
         &Default::default(),
+        &Default::default(),
     )
     .expect("the default config must resolve to a usable profile")
 }

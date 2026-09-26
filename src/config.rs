@@ -166,6 +166,34 @@ fn default_carrier() -> String {
     "udp".to_string()
 }
 
+/// The `[frame]` section: how a packet header is encoded on the wire.
+///
+/// **Negotiated.** Unlike the carrier and the KEX, the two peers can agree on
+/// this in message 2, so a mixed fleet can run different header layouts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrameConfig {
+    /// Header codec, as an ordered preference. `"v1-fixed"` (the default) is
+    /// the original packed 24-byte header; `"v2-tlv"` is a variable-length
+    /// layout that can carry optional fields.
+    ///
+    /// An unknown name is a **hard error**: peers running different header
+    /// layouts would connect, negotiate, and then misparse every single frame.
+    #[serde(default = "default_frame_codecs")]
+    pub codec: Vec<String>,
+}
+
+impl Default for FrameConfig {
+    fn default() -> Self {
+        Self {
+            codec: default_frame_codecs(),
+        }
+    }
+}
+
+fn default_frame_codecs() -> Vec<String> {
+    vec![crate::protocol::frame::DEFAULT_FRAME_CODEC.to_string()]
+}
+
 /// The `[handshake]` section: key exchange and profile negotiation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HandshakeConfig {
@@ -340,6 +368,8 @@ pub struct ServerConfig {
     pub fec: FecConfig,
     /// Resolved `[carrier]` configuration (byte carrier name).
     pub carrier: CarrierConfig,
+    /// Resolved `[frame]` configuration (header codec preference).
+    pub frame: FrameConfig,
     /// Resolved `[handshake]` configuration (KEX name + whether to propose).
     pub handshake: HandshakeConfig,
     /// Resolved `[crypto]` configuration (AEAD suite preference).
@@ -379,6 +409,7 @@ impl Default for ServerConfig {
             obfuscation: None,
             fec: FecConfig::default(),
             carrier: CarrierConfig::default(),
+            frame: FrameConfig::default(),
             handshake: HandshakeConfig::default(),
             crypto: CryptoConfig::default(),
             transport: TransportConfig::default(),
@@ -473,6 +504,8 @@ pub struct ClientConfig {
     pub fec: FecConfig,
     /// Resolved `[carrier]` configuration (byte carrier name).
     pub carrier: CarrierConfig,
+    /// Resolved `[frame]` configuration (header codec preference).
+    pub frame: FrameConfig,
     /// Resolved `[handshake]` configuration (KEX name + whether to propose).
     pub handshake: HandshakeConfig,
     /// Resolved `[crypto]` configuration (AEAD suite preference).
@@ -509,6 +542,7 @@ impl Default for ClientConfig {
             obfuscation: None,
             fec: FecConfig::default(),
             carrier: CarrierConfig::default(),
+            frame: FrameConfig::default(),
             handshake: HandshakeConfig::default(),
             crypto: CryptoConfig::default(),
             transport: TransportConfig::default(),
@@ -615,6 +649,12 @@ const FEC_SCHEMA: SectionSchema = SectionSchema {
     array_tables: &[],
 };
 
+const FRAME_SCHEMA: SectionSchema = SectionSchema {
+    scalars: &["codec"],
+    tables: &[],
+    array_tables: &[],
+};
+
 const CARRIER_SCHEMA: SectionSchema = SectionSchema {
     scalars: &["name"],
     tables: &[],
@@ -660,6 +700,7 @@ const SERVER_SCHEMA: SectionSchema = SectionSchema {
         ("obfuscation", &OBFUSCATION_SCHEMA),
         ("fec", &FEC_SCHEMA),
         ("carrier", &CARRIER_SCHEMA),
+        ("frame", &FRAME_SCHEMA),
         ("handshake", &HANDSHAKE_SCHEMA),
         ("crypto", &CRYPTO_SCHEMA),
         ("transport", &TRANSPORT_SCHEMA),
@@ -689,6 +730,7 @@ const CLIENT_SCHEMA: SectionSchema = SectionSchema {
         ("obfuscation", &OBFUSCATION_SCHEMA),
         ("fec", &FEC_SCHEMA),
         ("carrier", &CARRIER_SCHEMA),
+        ("frame", &FRAME_SCHEMA),
         ("handshake", &HANDSHAKE_SCHEMA),
         ("crypto", &CRYPTO_SCHEMA),
         ("transport", &TRANSPORT_SCHEMA),
@@ -897,6 +939,9 @@ pub struct ServerFileConfig {
     /// `[carrier]` section. `None` leaves the byte carrier at its default.
     #[serde(default)]
     pub carrier: Option<CarrierConfig>,
+    /// `[frame]` section. `None` leaves the header codec at its default.
+    #[serde(default)]
+    pub frame: Option<FrameConfig>,
     /// `[handshake]` section. `None` leaves the KEX and negotiation at defaults.
     #[serde(default)]
     pub handshake: Option<HandshakeConfig>,
@@ -982,6 +1027,9 @@ pub struct ClientFileConfig {
     /// `[carrier]` section. `None` leaves the byte carrier at its default.
     #[serde(default)]
     pub carrier: Option<CarrierConfig>,
+    /// `[frame]` section. `None` leaves the header codec at its default.
+    #[serde(default)]
+    pub frame: Option<FrameConfig>,
     /// `[handshake]` section. `None` leaves the KEX and negotiation at defaults.
     #[serde(default)]
     pub handshake: Option<HandshakeConfig>,
@@ -1107,6 +1155,9 @@ pub fn merge_server_config(
     }
     if let Some(v) = file.carrier {
         base.carrier = v;
+    }
+    if let Some(v) = file.frame {
+        base.frame = v;
     }
     if let Some(v) = file.handshake {
         base.handshake = v;
@@ -1260,6 +1311,9 @@ pub fn merge_client_config(
     }
     if let Some(v) = file.carrier {
         base.carrier = v;
+    }
+    if let Some(v) = file.frame {
+        base.frame = v;
     }
     if let Some(v) = file.handshake {
         base.handshake = v;
@@ -2339,6 +2393,7 @@ algorithm = "none"
             &defaults.transport,
             &defaults.fec,
             &defaults.congestion,
+            &defaults.frame,
         )
         .expect("the default config must resolve to a usable profile");
         assert_eq!(
@@ -2367,6 +2422,7 @@ algorithm = "none"
             &merged.transport,
             &merged.fec,
             &merged.congestion,
+            &merged.frame,
         )
         .expect("a well-formed profile config must resolve");
         assert!(profile.propose);
@@ -2396,6 +2452,7 @@ algorithm = "none"
             &merged.transport,
             &merged.fec,
             &merged.congestion,
+            &merged.frame,
         )
         .unwrap_err();
         assert!(err.to_string().contains("aes-gcm"), "got {err}");
@@ -2418,6 +2475,7 @@ mod dist_template_tests {
             &merged.transport,
             &merged.fec,
             &merged.congestion,
+            &merged.frame,
         )
         .unwrap_or_else(|e| panic!("shipped server.toml must resolve a usable profile: {e}"));
     }
@@ -2471,6 +2529,7 @@ mod dist_template_tests {
             &merged.transport,
             &merged.fec,
             &merged.congestion,
+            &merged.frame,
         )
         .unwrap_or_else(|e| panic!("shipped client.toml must resolve a usable profile: {e}"));
     }

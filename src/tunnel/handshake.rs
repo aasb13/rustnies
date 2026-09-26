@@ -411,6 +411,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         )
         .expect("the default config must resolve")
     }
@@ -440,6 +441,7 @@ mod tests {
                 scheme: fecs.iter().map(|s| s.to_string()).collect(),
                 ..Default::default()
             },
+            &Default::default(),
             &Default::default(),
         )
         .expect("test profile must resolve")
@@ -695,6 +697,7 @@ mod tests {
             cipher_ids: vec![201],
             transport_ids: vec![],
             fec_ids: vec![202],
+            frame_ids: vec![crate::protocol::frame::FRAME_V1_FIXED],
         };
         assert!(
             !respond_to_offer(&server_profile, &offer),
@@ -718,6 +721,7 @@ mod tests {
             cipher_ids: vec![201],
             transport_ids: vec![],
             fec_ids: vec![crate::fec::FEC_REED_SOLOMON],
+            frame_ids: vec![crate::protocol::frame::FRAME_V1_FIXED],
         };
         assert!(!respond_to_offer(&server_profile, &offer));
     }
@@ -826,6 +830,7 @@ mod tests {
             cipher_ids: vec![1],
             transport_ids: vec![],
             fec_ids: vec![1],
+            frame_ids: vec![crate::protocol::frame::FRAME_V1_FIXED],
         }
         .encode();
         encoded[0] = 99;
@@ -843,13 +848,28 @@ mod tests {
             cipher_ids: vec![1, 2],
             transport_ids: vec![],
             fec_ids: vec![1],
+            frame_ids: vec![crate::protocol::frame::FRAME_V1_FIXED],
         }
         .encode();
+        // Every proper prefix is rejected, with one deliberate exception: a
+        // payload ending cleanly after the third list is a valid pre-seam
+        // offer, which is how a client older than the frame codec stays
+        // compatible. The legacy length here is 1 (version) + 3 x (1 count
+        // + body).
+        let legacy_len = 1 + (1 + 2) + (1 + 0) + (1 + 1);
         for cut in 1..encoded.len() {
-            assert!(
-                ClientOffer::decode(&encoded[..cut]).is_err(),
-                "truncating to {cut} bytes must be rejected"
-            );
+            let decoded = ClientOffer::decode(&encoded[..cut]);
+            if cut == legacy_len {
+                assert!(
+                    decoded.is_ok(),
+                    "cut {cut} is the legacy three-list length and must decode"
+                );
+            } else {
+                assert!(
+                    decoded.is_err(),
+                    "truncating to {cut} bytes must be rejected, got {decoded:?}"
+                );
+            }
         }
     }
 
@@ -869,6 +889,7 @@ mod tests {
                 kex: "not-a-kex".into(),
                 propose: false,
             },
+            &Default::default(),
             &Default::default(),
             &Default::default(),
             &Default::default(),

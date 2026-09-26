@@ -116,7 +116,6 @@ use ipnet::IpNet;
 use crate::crypto::keys::KeyPair;
 use crate::obfuscation::{self, ObfuscationStack};
 use crate::protocol::SessionId;
-use crate::protocol::header::{HEADER_LEN, PROTOCOL_VERSION, PacketType};
 use crate::protocol::profile::{LocalProfile, ResolvedProfile};
 use crate::protocol::session::{Session, SessionRole};
 use crate::stats::Counters;
@@ -366,7 +365,11 @@ struct ClientHandle {
     /// Currently this holds the `header_xor` keystream (derived from the
     /// handshake hash). `None` means the layer is inactive/initialised; the
     /// dispatcher then falls back to the plain peek path.
-    pub_route_keystream: Option<[u8; HEADER_LEN]>,
+    ///
+    /// Sized to *this session's* codec `max_header_len()`, which is not
+    /// necessarily `HEADER_LEN` — a variable-length layout is whitenable over a
+    /// different number of bytes.
+    pub_route_keystream: Option<Vec<u8>>,
     /// Join handle so we can await/cleanup if needed.
     #[allow(dead_code)]
     join: JoinHandle<()>,
@@ -864,13 +867,6 @@ async fn handle_handshake(
             // here so each client's keystream is distinct.
             let session_stack = ctx.obf_stack.deref().clone();
             session_stack.init(&established.handshake_hash);
-            // Extract the per-session header_xor keystream (if any) so the
-            // dispatcher can de-whiten incoming headers and peek-route without
-            // the session's AEAD keys. This is public routing metadata only:
-            // derived from the handshake hash, and the AEAD AAD still
-            // authenticates the original header.
-            let pub_route_keystream =
-                extract_header_xor_keystream(&established.handshake_hash, &ctx.obf_stack);
             // Build this session's runnable profile from the negotiated
             // selection. The congestion controller is per-tunnel state, so a
             // fresh one is created here rather than shared from the server's
@@ -897,6 +893,18 @@ async fn handle_handshake(
                 peer = %from,
                 profile = %resolved.describe(),
                 "session profile instantiated"
+            );
+            // Extract the per-session header_xor keystream (if any) so the
+            // dispatcher can de-whiten incoming headers and peek-route without
+            // the session's AEAD keys. This is public routing metadata only:
+            // derived from the handshake hash, and the AEAD AAD still
+            // authenticates the original header. Its length comes from the
+            // negotiated codec, so a variable-length layout is whitenable over
+            // the right number of bytes.
+            let pub_route_keystream = extract_header_xor_keystream(
+                &established.handshake_hash,
+                &ctx.obf_stack,
+                resolved.codec.max_header_len(),
             );
             spawn_client(
                 session_carrier,
@@ -939,7 +947,8 @@ fn spawn_client(
     established: handshake::SessionEstablished,
     sessions: &mut HashMap<SessionId, ClientHandle>,
     addr_index: &mut HashMap<SocketAddr, SessionId>,
-    pub_route_keystream: Option<[u8; HEADER_LEN]>,
+    // Sized to this session's codec `max_header_len()`.
+    pub_route_keystream: Option<Vec<u8>>,
 ) {
     let counters = ctx.counters.clone();
     let tun_write_tx = ctx.tun_write_tx.clone();
@@ -1231,7 +1240,8 @@ fn build_session_list(
 fn extract_header_xor_keystream(
     handshake_hash: &[u8; 32],
     shared_stack: &obfuscation::ObfuscationStack,
-) -> Option<[u8; HEADER_LEN]> {
+    header_len: usize,
+) -> Option<Vec<u8>> {
     if !shared_stack.active() || !shared_stack.names().contains(&"header_xor") {
         return None;
     }
@@ -1239,9 +1249,12 @@ fn extract_header_xor_keystream(
     use hkdf::Hkdf;
     use sha2::Sha256;
     let hk = Hkdf::<Sha256>::new(None, handshake_hash);
-    let mut out = [0u8; HEADER_LEN];
+    // Whitening covers the header, so its length is the *negotiated codec's*
+    // bound, not the compiled-in one. Both sides derive the same length from
+    // the same selection, so this stays in lock-step.
+    let mut out = vec![0u8; header_len];
     hk.expand(HKDF_INFO, &mut out)
-        .expect("HKDF expand of 24 bytes cannot fail");
+        .expect("HKDF expand of a header-sized output cannot fail");
     Some(out)
 }
 
@@ -1261,14 +1274,12 @@ fn extract_header_xor_keystream(
 /// task). It is used only to route the datagram to the right session's decrypt
 /// attempt without a full parse.
 fn peek_session_id(datagram: &[u8]) -> Option<SessionId> {
-    if datagram.len() < HEADER_LEN {
-        return None;
-    }
-    if datagram[0] != PROTOCOL_VERSION {
-        return None;
-    }
-    let _ = PacketType::from_byte(datagram[1])?;
-    let id = SessionId::from_le_bytes([datagram[2], datagram[3], datagram[4], datagram[5]]);
+    // Codec-agnostic on purpose. A datagram server must route a frame before it
+    // knows which session it belongs to, and therefore before it knows that
+    // session's *negotiated* codec. `peek_any_session_id` tries each codec in
+    // turn; at most one can claim a buffer, because each requires a distinct
+    // wire discriminator.
+    let id = crate::protocol::frame::peek_any_session_id(datagram)?;
     if id == 0 {
         return None; // 0 is reserved (never assigned by session_id_from_hash)
     }
@@ -1343,9 +1354,9 @@ fn peek_routed_session(
     // the version/packet-type check with overwhelming probability, so this
     // never misroutes — only the correct keystream produces a valid header.
     for h in sessions.values() {
-        if let Some(ks) = h.pub_route_keystream {
+        if let Some(ks) = h.pub_route_keystream.as_ref() {
             let mut dewhitened = unwrapped.clone();
-            let n = dewhitened.len().min(HEADER_LEN);
+            let n = dewhitened.len().min(ks.len());
             for i in 0..n {
                 dewhitened[i] ^= ks[i];
             }
@@ -1407,6 +1418,7 @@ fn note_implausible_ip(seen: &mut std::collections::HashSet<Ipv4Addr>, src: Ipv4
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::header::{HEADER_LEN, PROTOCOL_VERSION, PacketType};
 
     #[test]
     fn ipv4_helpers() {
@@ -1512,10 +1524,29 @@ mod tests {
     }
 
     #[test]
-    fn peek_session_id_rejects_short_datagram() {
-        let mut pkt = stub_header(PacketType::Data, 42);
-        pkt.truncate(HEADER_LEN - 1);
-        assert_eq!(peek_session_id(&pkt), None, "too short to hold a header");
+    fn peek_session_id_needs_only_the_route_prefix() {
+        // Routing reads the version, the type and the session id -- 6 bytes, not
+        // a whole 24-byte header. A frame one byte short of a full header must
+        // still route, or the server would drop legitimate traffic as noise
+        // whenever the envelope or obfuscation trimmed the tail.
+        let full = stub_header(PacketType::Data, 42);
+        for cut in 1..6 {
+            assert_eq!(
+                peek_session_id(&full[..cut]),
+                None,
+                "{cut} bytes: no prefix yet"
+            );
+        }
+        assert_eq!(
+            peek_session_id(&full[..6]),
+            Some(42),
+            "exactly the route prefix is enough"
+        );
+        assert_eq!(
+            peek_session_id(&full[..HEADER_LEN - 1]),
+            Some(42),
+            "one byte short of a full header still routes"
+        );
     }
 
     #[test]
@@ -1934,17 +1965,17 @@ mod tests {
 
     // ---- header_xor de-whitening peek ----
 
-    fn keystream_for(seed: &[u8; 32]) -> [u8; HEADER_LEN] {
+    fn keystream_for(seed: &[u8; 32]) -> Vec<u8> {
         use crate::obfuscation::header_xor::HKDF_INFO;
         use hkdf::Hkdf;
         use sha2::Sha256;
         let hk = Hkdf::<Sha256>::new(None, seed);
-        let mut out = [0u8; HEADER_LEN];
+        let mut out = vec![0u8; HEADER_LEN];
         hk.expand(HKDF_INFO, &mut out).expect("hkdf");
         out
     }
 
-    fn whiten(frame: &[u8], ks: &[u8; HEADER_LEN]) -> Vec<u8> {
+    fn whiten(frame: &[u8], ks: &[u8]) -> Vec<u8> {
         let mut out = frame.to_vec();
         let n = out.len().min(HEADER_LEN);
         for i in 0..n {
@@ -1961,7 +1992,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut h = make_handle(addr_old).await;
         h.peer_key = [0xEEu8; 32];
-        h.pub_route_keystream = Some(ks);
+        h.pub_route_keystream = Some(ks.clone());
         sessions.insert(sid, h);
         let transport = plain();
         let frame = stub_header(PacketType::Data, sid);

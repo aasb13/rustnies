@@ -48,9 +48,12 @@
 //! protocol version bump, not a config knob, and a stale peer could not be told
 //! so gracefully.
 
+use std::sync::Arc;
+
 use crate::congestion::{CongestionControl, build_congestion};
 use crate::crypto::suite::{AeadCipher, CipherKind, DEFAULT_CIPHER, select_cipher};
 use crate::fec::{DEFAULT_FEC_SCHEME, FecScheme, FecSchemeKind, select_fec_scheme};
+use crate::protocol::frame::{self as frame_codec, DEFAULT_FRAME_CODEC, FrameCodec};
 use crate::transport::{
     DEFAULT_TAG, TRANSPORT_SAME_AS_HANDSHAKE, Transport, build_transport_id, transport_id,
     transport_name,
@@ -73,6 +76,18 @@ pub type Part = &'static str;
 pub const PART_CIPHER: Part = "cipher";
 pub const PART_TRANSPORT: Part = "transport";
 pub const PART_FEC: Part = "fec";
+/// The header codec — how a [`PacketHeader`] is serialised. Negotiated like any
+/// other part, because two peers must agree on it byte-for-byte or every frame
+/// after the handshake is misparsed.
+pub const PART_FRAME: Part = "frame";
+
+/// Byte length of a `Selection` that predates the frame codec.
+///
+/// Message 2's payload slot was 6 bytes; the codec id is a 7th, appended. A
+/// short payload is therefore read as "v1-fixed", which is what a
+/// pre-seam server meant by it. This is the same additive rule the message-1
+/// offer follows: old peers keep working, new peers get the extra field.
+pub const SELECTION_LEGACY_LEN: usize = 6;
 
 /// Errors from resolving or negotiating a profile.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -125,6 +140,9 @@ pub fn part_name(part: Part, id: u8) -> String {
         PART_CIPHER => CipherKind::from_id(id).map(|k| k.name().to_string()),
         PART_TRANSPORT => transport_name(id).map(str::to_string),
         PART_FEC => FecSchemeKind::from_id(id).map(|k| k.name().to_string()),
+        PART_FRAME => frame_codec::frame_codec_by_id(id)
+            .ok()
+            .map(|c| c.name().to_string()),
         _ => None,
     };
     known.unwrap_or_else(|| format!("id#{id}"))
@@ -150,6 +168,8 @@ pub struct ClientOffer {
     pub transport_ids: Vec<u8>,
     /// FEC scheme ids, most preferred first.
     pub fec_ids: Vec<u8>,
+    /// Header codec ids, most preferred first.
+    pub frame_ids: Vec<u8>,
 }
 
 impl ClientOffer {
@@ -166,6 +186,7 @@ impl ClientOffer {
             cipher_ids: prefs.cipher_ids().into_iter().flatten().collect(),
             transport_ids: prefs.transport_ids().into_iter().flatten().collect(),
             fec_ids: prefs.fec_ids().into_iter().flatten().collect(),
+            frame_ids: prefs.frame_ids().into_iter().flatten().collect(),
         }
     }
 
@@ -180,6 +201,7 @@ impl ClientOffer {
             PART_CIPHER => &self.cipher_ids,
             PART_TRANSPORT => &self.transport_ids,
             PART_FEC => &self.fec_ids,
+            PART_FRAME => &self.frame_ids,
             _ => &[],
         }
     }
@@ -198,13 +220,25 @@ impl ClientOffer {
     /// [1] cipher count,     then cipher count     x u8
     /// [ ] transport count,  then transport count  x u8
     /// [ ] fec count,        then fec count        x u8
+    /// [ ] frame count,      then frame count      x u8
     /// ```
+    ///
+    /// The frame list is last and therefore optional: a decoder that stops after
+    /// three lists still parses, which is what keeps a pre-seam client working.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(
-            4 + self.cipher_ids.len() + self.transport_ids.len() + self.fec_ids.len(),
+            5 + self.cipher_ids.len()
+                + self.transport_ids.len()
+                + self.fec_ids.len()
+                + self.frame_ids.len(),
         );
         out.push(NEGOTIATION_VERSION);
-        for list in [&self.cipher_ids, &self.transport_ids, &self.fec_ids] {
+        for list in [
+            &self.cipher_ids,
+            &self.transport_ids,
+            &self.fec_ids,
+            &self.frame_ids,
+        ] {
             let n = list.len().min(MAX_OFFER_ALTERNATIVES);
             out.push(n as u8);
             out.extend_from_slice(&list[..n]);
@@ -219,10 +253,21 @@ impl ClientOffer {
             return Ok(None);
         }
         let mut cur = Cursor::new(payload)?;
+        let cipher_ids = cur.take_list()?;
+        let transport_ids = cur.take_list()?;
+        let fec_ids = cur.take_list()?;
+        // Absent means the peer predates the frame codec; it can only be
+        // running the default, so that is what it gets.
+        let frame_ids = if cur.at_end() {
+            vec![frame_codec::FRAME_V1_FIXED]
+        } else {
+            cur.take_list()?
+        };
         Ok(Some(Self {
-            cipher_ids: cur.take_list()?,
-            transport_ids: cur.take_list()?,
-            fec_ids: cur.take_list()?,
+            cipher_ids,
+            transport_ids,
+            fec_ids,
+            frame_ids,
         }))
     }
 }
@@ -242,6 +287,11 @@ impl<'a> Cursor<'a> {
             return Err(ProfileError::UnsupportedVersion(version));
         }
         Ok(Self { buf, pos: 1 })
+    }
+
+    /// `true` when every declared list has been consumed.
+    fn at_end(&self) -> bool {
+        self.pos >= self.buf.len()
     }
 
     fn take_list(&mut self) -> Result<Vec<u8>, ProfileError> {
@@ -291,6 +341,9 @@ pub struct Selection {
     /// Framing tag for the data transport. Carried here so a custom
     /// `[transport] tag_hex` needs no matching client config.
     pub transport_tag: [u8; 2],
+    /// Negotiated header codec. Appended last so a 6-byte (pre-seam) payload
+    /// still decodes, defaulting to [`frame_codec::FRAME_V1_FIXED`].
+    pub frame: u8,
 }
 
 /// The sentinel transport id meaning "reuse the handshake envelope". It is
@@ -310,6 +363,7 @@ impl Selection {
             transport: TRANSPORT_SAME_AS_HANDSHAKE_ID,
             fec: FecSchemeKind::ReedSolomon.id(),
             transport_tag: DEFAULT_TAG,
+            frame: frame_codec::FRAME_V1_FIXED,
         }
     }
 
@@ -328,6 +382,7 @@ impl Selection {
             self.fec,
             self.transport_tag[0],
             self.transport_tag[1],
+            self.frame,
         ]
     }
 
@@ -343,14 +398,21 @@ impl Selection {
         if payload[0] != NEGOTIATION_VERSION {
             return Err(ProfileError::UnsupportedVersion(payload[0]));
         }
-        if payload.len() < 6 {
+        if payload.len() < SELECTION_LEGACY_LEN {
             return Err(ProfileError::malformed("selection shorter than 6 bytes"));
         }
+        // A 6-byte payload predates the frame codec; the only codec it could
+        // have meant is the one that was then the only codec.
+        let frame = match payload.get(6) {
+            Some(&f) => f,
+            None => frame_codec::FRAME_V1_FIXED,
+        };
         Ok(Self {
             cipher: payload[1],
             transport: payload[2],
             fec: payload[3],
             transport_tag: [payload[4], payload[5]],
+            frame,
         })
     }
 
@@ -364,6 +426,7 @@ impl Selection {
             (PART_CIPHER, self.cipher),
             (PART_TRANSPORT, self.transport),
             (PART_FEC, self.fec),
+            (PART_FRAME, self.frame),
         ] {
             let known = match part {
                 PART_CIPHER => CipherKind::from_id(id).is_some(),
@@ -371,6 +434,7 @@ impl Selection {
                     id == TRANSPORT_SAME_AS_HANDSHAKE_ID || transport_name(id).is_some()
                 }
                 PART_FEC => FecSchemeKind::from_id(id).is_some(),
+                PART_FRAME => frame_codec::frame_codec_by_id(id).is_ok(),
                 _ => false,
             };
             if !known {
@@ -383,15 +447,20 @@ impl Selection {
     /// A stable one-line description, for the session-up log.
     pub fn describe(&self, congestion: &str) -> String {
         format!(
-            "cipher={} transport={} fec={} congestion={congestion}(local)",
+            "cipher={} transport={} fec={} frame={} congestion={congestion}(local)",
             self.cipher_name(),
             self.transport_name(),
             self.fec_name(),
+            self.frame_name(),
         )
     }
 
     fn cipher_name(&self) -> String {
         part_name(PART_CIPHER, self.cipher)
+    }
+
+    fn frame_name(&self) -> String {
+        part_name(PART_FRAME, self.frame)
     }
 
     fn transport_name(&self) -> String {
@@ -457,11 +526,21 @@ pub fn negotiate(
         |id| FecSchemeKind::from_id(id).is_some(),
     )?;
 
+    let frame = pick(
+        PART_FRAME,
+        &prefs.frame_ids(),
+        &prefs.frame_names(),
+        offer,
+        || Selection::defaults().frame,
+        |id| frame_codec::frame_codec_by_id(id).is_ok(),
+    )?;
+
     let sel = Selection {
         cipher,
         transport,
         fec,
         transport_tag: data_tag,
+        frame,
     };
     sel.check()?;
     Ok(sel)
@@ -531,6 +610,8 @@ pub struct ProfilePrefs {
     pub transports: Vec<String>,
     /// FEC scheme names, most preferred first.
     pub fecs: Vec<String>,
+    /// Header codec names, most preferred first.
+    pub frames: Vec<String>,
 }
 
 impl ProfilePrefs {
@@ -543,6 +624,7 @@ impl ProfilePrefs {
         ciphers: &[String],
         transports: &[String],
         fecs: &[String],
+        frames: &[String],
     ) -> Result<Self, ProfileError> {
         let ciphers = non_empty_or(ciphers, DEFAULT_CIPHER);
         for name in &ciphers {
@@ -563,10 +645,16 @@ impl ProfilePrefs {
         for name in &fecs {
             select_fec_scheme(name).map_err(|e| ProfileError::Config(e.to_string()))?;
         }
+        let frames = non_empty_or(frames, DEFAULT_FRAME_CODEC);
+        for name in &frames {
+            frame_codec::build_frame_codec(name)
+                .map_err(|e| ProfileError::Config(e.to_string()))?;
+        }
         Ok(Self {
             ciphers,
             transports,
             fecs,
+            frames,
         })
     }
 
@@ -601,6 +689,19 @@ impl ProfilePrefs {
             .collect()
     }
 
+    /// Header codec ids, in preference order.
+    fn frame_ids(&self) -> Vec<Option<u8>> {
+        self.frames
+            .iter()
+            .filter_map(|n| frame_codec::build_frame_codec(n).ok())
+            .map(|c| Some(c.wire_id()))
+            .collect()
+    }
+
+    fn frame_names(&self) -> Vec<String> {
+        self.frames.clone()
+    }
+
     fn cipher_names(&self) -> Vec<String> {
         self.ciphers.clone()
     }
@@ -629,6 +730,7 @@ impl ProfilePrefs {
             ciphers: vec![DEFAULT_CIPHER.to_string()],
             transports: vec![TRANSPORT_SAME_AS_HANDSHAKE.to_string()],
             fecs: vec![DEFAULT_FEC_SCHEME.to_string()],
+            frames: vec![DEFAULT_FRAME_CODEC.to_string()],
         }
     }
 }
@@ -717,6 +819,9 @@ pub struct ResolvedProfile {
     pub transport: Box<dyn Transport>,
     /// Erasure code.
     pub fec: Box<dyn FecScheme>,
+    /// Header codec: how a `PacketHeader` becomes bytes. Shared by `Arc` because
+    /// it is stateless and the server hands the same one to every session.
+    pub codec: Arc<dyn FrameCodec>,
     /// Local rate limiting.
     pub congestion: Box<dyn CongestionControl>,
     /// The selection this was built from, kept for logs and stats.
@@ -745,10 +850,13 @@ impl ResolvedProfile {
         let fec = FecSchemeKind::from_id(selection.fec)
             .ok_or_else(|| ProfileError::unsupported(PART_FEC, selection.fec))?
             .build();
+        let codec = frame_codec::frame_codec_by_id(selection.frame)
+            .map_err(|_| ProfileError::unsupported(PART_FRAME, selection.frame))?;
         Ok(Self {
             cipher,
             transport,
             fec,
+            codec,
             congestion,
             selection: *selection,
         })
@@ -777,10 +885,13 @@ impl ResolvedProfile {
         let fec = FecSchemeKind::from_id(selection.fec)
             .ok_or_else(|| ProfileError::unsupported(PART_FEC, selection.fec))?
             .build();
+        let codec = frame_codec::frame_codec_by_id(selection.frame)
+            .map_err(|_| ProfileError::unsupported(PART_FRAME, selection.frame))?;
         Ok(Self {
             cipher,
             transport,
             fec,
+            codec,
             congestion,
             selection: *selection,
         })
@@ -804,6 +915,7 @@ impl std::fmt::Debug for ResolvedProfile {
             .field("cipher", &self.cipher.name())
             .field("transport", &self.transport.name())
             .field("fec", &self.fec.name())
+            .field("frame", &self.codec.name())
             .field("congestion", &self.congestion.name())
             .field("selection", &self.selection)
             .finish()
@@ -816,6 +928,9 @@ impl Clone for ResolvedProfile {
             cipher: self.cipher.boxed_clone(),
             transport: self.transport.boxed_clone(),
             fec: self.fec.boxed_clone(),
+            // The codec is stateless, so sharing it is correct (unlike
+            // congestion, whose window is per-tunnel state).
+            codec: self.codec.clone(),
             // Congestion state is per-tunnel and must not be shared, so rebuild
             // from the name. Every name a ResolvedProfile can hold was produced
             // by a registry lookup, so this cannot fail; if a new controller
@@ -872,6 +987,7 @@ impl LocalProfile {
         fecs: &[String],
         data_tag: [u8; 2],
         congestion_algorithm: &str,
+        frames: &[String],
     ) -> Result<Self, ProfileError> {
         // Validate the KEX up front. It is the one part both peers must agree
         // on and the one part that cannot be negotiated, so a typo is fatal on
@@ -883,7 +999,7 @@ impl LocalProfile {
                 "unknown [transport] handshake envelope {handshake_transport:?} (supported: plain, tagged)"
             )));
         }
-        let prefs = ProfilePrefs::resolve(ciphers, transports, fecs)?;
+        let prefs = ProfilePrefs::resolve(ciphers, transports, fecs, frames)?;
         Ok(Self {
             kex_name: kex_name.trim().to_string(),
             prefs,
@@ -916,6 +1032,7 @@ impl LocalProfile {
         transport: &crate::config::TransportConfig,
         fec: &crate::config::FecConfig,
         congestion: &crate::config::CongestionConfig,
+        frame: &crate::config::FrameConfig,
     ) -> Result<Self, ProfileError> {
         let data_tag = crate::transport::parse_tag(transport.tag_hex.as_deref())
             .map_err(|e| ProfileError::Config(format!("[transport] tag_hex: {e}")))?;
@@ -928,6 +1045,7 @@ impl LocalProfile {
             &fec.scheme,
             data_tag,
             &congestion.algorithm,
+            &frame.codec,
         )
     }
 }
@@ -943,19 +1061,35 @@ mod tests {
     };
 
     fn prefs(ciphers: &[&str], transports: &[&str], fecs: &[&str]) -> ProfilePrefs {
-        ProfilePrefs::resolve(
-            &ciphers.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            &transports.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            &fecs.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-        )
-        .expect("test prefs must resolve")
+        prefs_with_frames(ciphers, transports, fecs, &[DEFAULT_FRAME_CODEC])
+    }
+
+    fn prefs_with_frames(
+        ciphers: &[&str],
+        transports: &[&str],
+        fecs: &[&str],
+        frames: &[&str],
+    ) -> ProfilePrefs {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        ProfilePrefs::resolve(&v(ciphers), &v(transports), &v(fecs), &v(frames))
+            .expect("test prefs must resolve")
     }
 
     fn offer(ciphers: &[u8], transports: &[u8], fecs: &[u8]) -> ClientOffer {
+        offer_with_frames(ciphers, transports, fecs, &[frame_codec::FRAME_V1_FIXED])
+    }
+
+    fn offer_with_frames(
+        ciphers: &[u8],
+        transports: &[u8],
+        fecs: &[u8],
+        frames: &[u8],
+    ) -> ClientOffer {
         ClientOffer {
             cipher_ids: ciphers.to_vec(),
             transport_ids: transports.to_vec(),
             fec_ids: fecs.to_vec(),
+            frame_ids: frames.to_vec(),
         }
     }
 
@@ -963,7 +1097,7 @@ mod tests {
 
     #[test]
     fn empty_lists_resolve_to_the_rustnies_defaults() {
-        let p = ProfilePrefs::resolve(&[], &[], &[]).unwrap();
+        let p = ProfilePrefs::resolve(&[], &[], &[], &[]).unwrap();
         assert_eq!(p, ProfilePrefs::rustnies_default());
         assert_eq!(p.ciphers, [DEFAULT_CIPHER]);
         assert_eq!(p.fecs, [DEFAULT_FEC_SCHEME]);
@@ -985,6 +1119,7 @@ mod tests {
                 &c.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
                 &t.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
                 &f.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                &[],
             )
             .unwrap_err();
             assert!(
@@ -1024,18 +1159,73 @@ mod tests {
         );
     }
 
+    /// A truncated offer is rejected — with exactly one exception: a payload
+    /// that ends cleanly after the third list is a *valid* pre-seam offer, and
+    /// must decode with the default frame codec. That is the compat rule that
+    /// lets a client built before the codec existed negotiate with a server
+    /// built after it.
     #[test]
-    fn offer_decode_rejects_a_truncated_body() {
-        let bytes = offer(&[1, 2], &[3], &[4]).encode();
-        for cut in 1..bytes.len() {
-            assert!(
-                matches!(
-                    ClientOffer::decode(&bytes[..cut]),
-                    Err(ProfileError::Malformed(_))
-                ),
-                "truncating to {cut} bytes must be a Malformed error"
-            );
+    fn offer_decode_rejects_a_truncated_body_but_accepts_a_pre_frame_payload() {
+        let full = offer(&[1, 2], &[3], &[4]).encode();
+        // The length of the legacy (three-list) encoding: version + three
+        // (count, body) pairs.
+        let legacy_len = 1 + 1 + 2 + 1 + 1 + 1 + 1;
+
+        for cut in 1..full.len() {
+            let decoded = ClientOffer::decode(&full[..cut]);
+            if cut == legacy_len {
+                let got = decoded
+                    .expect("a three-list payload is a valid legacy offer")
+                    .expect("a non-empty payload decodes to Some");
+                assert_eq!(
+                    got,
+                    ClientOffer {
+                        cipher_ids: vec![1, 2],
+                        transport_ids: vec![3],
+                        fec_ids: vec![4],
+                        // Absent means the default, which is the only codec
+                        // that existed when the payload was written.
+                        frame_ids: vec![frame_codec::FRAME_V1_FIXED],
+                    },
+                    "a payload ending after the third list is the legacy format"
+                );
+            } else {
+                assert!(
+                    matches!(decoded, Err(ProfileError::Malformed(_))),
+                    "truncating to {cut} bytes must be rejected, got {decoded:?}"
+                );
+            }
         }
+    }
+
+    /// The legacy encoding must still decode, because that is the whole point
+    /// of the append-only rule.
+    #[test]
+    fn a_three_list_offer_decodes_with_the_default_frame_codec() {
+        let legacy = vec![NEGOTIATION_VERSION, 1, 7, 0, 1, 8];
+        let o = ClientOffer::decode(&legacy)
+            .expect("legacy offer must decode")
+            .expect("a non-empty payload decodes to Some");
+        assert_eq!(o.cipher_ids, [7]);
+        assert!(o.transport_ids.is_empty());
+        assert_eq!(o.fec_ids, [8]);
+        assert_eq!(o.frame_ids, [frame_codec::FRAME_V1_FIXED]);
+    }
+
+    /// Likewise a 6-byte `Selection` (pre-seam) must decode to the default
+    /// codec, and a 7-byte one must carry it.
+    #[test]
+    fn a_legacy_selection_decodes_to_the_default_frame_codec() {
+        let legacy = vec![NEGOTIATION_VERSION, 1, 2, 1, 0xAA, 0xBB];
+        let sel = Selection::decode(&legacy).expect("legacy selection must decode");
+        assert_eq!(sel.frame, frame_codec::FRAME_V1_FIXED);
+        assert_eq!(sel.cipher, 1);
+        assert_eq!(sel.transport_tag, [0xAA, 0xBB]);
+
+        let mut with_frame = legacy.clone();
+        with_frame.push(9);
+        let sel = Selection::decode(&with_frame).unwrap();
+        assert_eq!(sel.frame, 9, "a 7th byte is the codec id");
     }
 
     #[test]
@@ -1080,6 +1270,7 @@ mod tests {
             transport: TRANSPORT_TAGGED,
             fec: FEC_NONE_ID,
             transport_tag: [0xAA, 0xBB],
+            frame: frame_codec::FRAME_V1_FIXED,
         };
         assert_eq!(Selection::decode(&sel.encode()).unwrap(), sel);
     }
@@ -1410,6 +1601,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         )
         .unwrap();
         assert!(!p.propose);
@@ -1425,6 +1617,7 @@ mod tests {
                 kex: "noise-ik".into(),
                 propose: true,
             },
+            &Default::default(),
             &Default::default(),
             &Default::default(),
             &Default::default(),
@@ -1448,6 +1641,7 @@ mod tests {
             },
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         )
         .unwrap_err();
         assert!(matches!(err, ProfileError::Config(_)), "got {err:?}");
@@ -1463,6 +1657,7 @@ mod tests {
                 data: vec!["tagged".into()],
                 tag_hex: Some("abcd".into()),
             },
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         )
@@ -1485,6 +1680,7 @@ mod tests {
             },
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         )
         .unwrap_err();
         assert!(matches!(err, ProfileError::Config(_)), "got {err:?}");
@@ -1493,6 +1689,7 @@ mod tests {
     #[test]
     fn new_congestion_returns_independent_controllers() {
         let p = LocalProfile::from_role_config(
+            &Default::default(),
             &Default::default(),
             &Default::default(),
             &Default::default(),

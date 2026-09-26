@@ -323,6 +323,7 @@ pub async fn run_client(mut cfg: ClientConfig) -> std::io::Result<()> {
         &cfg.transport,
         &cfg.fec,
         &cfg.congestion,
+        &cfg.frame,
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -688,6 +689,7 @@ pub async fn run_server(cfg: ServerConfig) -> std::io::Result<()> {
         &cfg.transport,
         &cfg.fec,
         &cfg.congestion,
+        &cfg.frame,
     ) {
         Ok(p) => p,
         Err(e) => {

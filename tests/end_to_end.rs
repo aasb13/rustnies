@@ -266,6 +266,7 @@ fn default_profile() -> LocalProfile {
         &Default::default(),
         &Default::default(),
         &Default::default(),
+        &Default::default(),
     )
     .expect("the default config must resolve to a usable profile")
 }
@@ -1687,8 +1688,15 @@ fn profile_from(
     fec: rustnies::config::FecConfig,
     congestion: rustnies::config::CongestionConfig,
 ) -> LocalProfile {
-    LocalProfile::from_role_config(&handshake, &crypto, &transport, &fec, &congestion)
-        .expect("test profile must resolve")
+    LocalProfile::from_role_config(
+        &handshake,
+        &crypto,
+        &transport,
+        &fec,
+        &congestion,
+        &Default::default(),
+    )
+    .expect("test profile must resolve")
 }
 
 /// A full loopback session over a deliberately non-default profile: FEC off,

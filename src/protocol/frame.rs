@@ -91,6 +91,30 @@ pub trait FrameCodec: Send + Sync + 'static {
     /// dropped, so this is a hint, never an authority.
     fn peek_session_id(&self, buf: &[u8]) -> Option<SessionId>;
 
+    /// Where `frame`'s header ends and its body begins.
+    ///
+    /// This is the reason the trait takes a whole frame rather than a
+    /// fixed-size header array: a variable-length codec finds its own boundary
+    /// and this reports it. For a fixed-layout codec it is always
+    /// [`FrameCodec::max_header_len`].
+    ///
+    /// `frame` must be a frame this codec has already accepted — call
+    /// [`FrameCodec::read_header`] first, so a malformed frame is rejected
+    /// rather than silently yielding a bogus offset.
+    fn body_offset(&self, frame: &[u8]) -> usize;
+
+    /// The header's encoding as a standalone buffer.
+    ///
+    /// Used for AEAD associated data, which must be byte-identical to the
+    /// header the sender authenticated. Infinible by construction: the buffer
+    /// is sized from [`FrameCodec::max_header_len`].
+    fn encode_header(&self, header: &PacketHeader) -> bytes::Bytes {
+        let mut out = BytesMut::with_capacity(self.max_header_len());
+        self.write_header(header, &mut out)
+            .expect("buffer sized from max_header_len cannot be too small");
+        out.freeze()
+    }
+
     /// Encode `header || ciphertext` — the full plaintext frame, pre-envelope.
     fn encode_frame(&self, header: &PacketHeader, ciphertext: &[u8]) -> BytesMut {
         let mut out = BytesMut::with_capacity(self.max_header_len() + ciphertext.len());
@@ -202,6 +226,13 @@ impl FrameCodec for V1FixedCodec {
         Some(SessionId::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]))
     }
 
+    fn body_offset(&self, frame: &[u8]) -> usize {
+        // Fixed layout: always exactly HEADER_LEN. `min` guards a frame that
+        // was truncated after `read_header` accepted it, which cannot happen
+        // but keeps this total rather than panicking.
+        HEADER_LEN.min(frame.len())
+    }
+
     fn box_clone(&self) -> Box<dyn FrameCodec> {
         Box::new(*self)
     }
@@ -210,6 +241,12 @@ impl FrameCodec for V1FixedCodec {
 /// Wire id for [`V1FixedCodec`].
 pub const FRAME_V1_FIXED: u8 = 1;
 
+/// The default codec's config name.
+///
+/// Also the codec a pre-seam peer is assumed to run: it is the only one that
+/// existed, so a 6-byte `Selection` and a three-list offer both decode to it.
+pub const DEFAULT_FRAME_CODEC: &str = "v1-fixed";
+
 /// Bytes of a v1-fixed message needed to recover the `SessionId`:
 /// version (1) + packet_type (1) + session_id (4).
 pub const V1_ROUTE_PREFIX_LEN: usize = 6;
@@ -217,6 +254,35 @@ pub const V1_ROUTE_PREFIX_LEN: usize = 6;
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
+
+/// Every codec in this build, for the codec-agnostic peek.
+///
+/// A datagram server has to route a frame *before* it knows which session it
+/// belongs to, and therefore before it knows that session's negotiated codec.
+/// So the routing peek cannot ask one codec — it has to try them all.
+///
+/// This is unambiguous because each codec's `looks_like_frame` requires a
+/// distinct wire discriminator (the version byte for v1-fixed, the TLV magic
+/// for v2-tlv), so at most one can accept a given buffer. Adding a codec is one
+/// entry here; the ordering is irrelevant.
+pub const ALL_CODECS: &[fn() -> Box<dyn FrameCodec>] = &[|| Box::new(V1FixedCodec::new())];
+
+/// Route a frame to a session without knowing its codec.
+///
+/// Returns `None` if no codec claims the buffer — which is the normal answer
+/// for a handshake message and for scan noise. As with a single codec's peek,
+/// this is a *hint*: a match routes the frame to one session's decrypt attempt,
+/// and the AEAD tag is what actually decides.
+pub fn peek_any_session_id(buf: &[u8]) -> Option<SessionId> {
+    ALL_CODECS
+        .iter()
+        .find_map(|make| make().peek_session_id(buf))
+}
+
+/// Whether any codec claims `buf`.
+pub fn any_codec_claims(buf: &[u8]) -> bool {
+    ALL_CODECS.iter().any(|make| make().looks_like_frame(buf))
+}
 
 /// Registry of known frame codecs, keyed by config name.
 ///
@@ -361,11 +427,134 @@ mod tests {
     }
 
     #[test]
+    fn encode_header_matches_the_header_prefix_of_encode_frame() {
+        // The AEAD AAD is `encode_header`, and the frame's header must be the
+        // same bytes or every decrypt fails. Pin that they agree.
+        let c = V1FixedCodec::new();
+        let h = sample();
+        let aad = c.encode_header(&h);
+        let frame = c.encode_frame(&h, b"body");
+        assert_eq!(&aad[..], &frame[..HEADER_LEN]);
+    }
+
+    #[test]
+    fn body_offset_splits_frame_from_body() {
+        let c = V1FixedCodec::new();
+        let h = sample();
+        let frame = c.encode_frame(&h, b"the body");
+        let off = c.body_offset(&frame);
+        assert_eq!(off, HEADER_LEN);
+        assert_eq!(&frame[off..], b"the body");
+    }
+
+    #[test]
+    fn body_offset_of_a_header_only_frame_is_the_header_len() {
+        let c = V1FixedCodec::new();
+        let frame = c.encode_frame(&sample(), b"");
+        assert_eq!(c.body_offset(&frame), HEADER_LEN);
+        assert!(frame[c.body_offset(&frame)..].is_empty());
+    }
+
+    #[test]
+    fn encode_then_decode_then_encode_is_stable() {
+        // AAD is re-encoded on the receive path from the *decoded* header, so a
+        // codec whose round-trip is not exact would authenticate a different
+        // byte string than the sender used and fail every packet. This is the
+        // property the whole design depends on.
+        let c = V1FixedCodec::new();
+        let h = sample();
+        let once = c.encode_header(&h);
+        let decoded = c.read_header(&once).unwrap();
+        let twice = c.encode_header(&decoded);
+        assert_eq!(once, twice, "header encoding must be round-trip stable");
+    }
+
+    #[test]
+    fn every_sample_header_survives_the_full_seam() {
+        // Sweep the extremes rather than one happy-path header.
+        let c = V1FixedCodec::new();
+        for (sid, seq, ptype) in [
+            (0u32, 0u32, PacketType::Data),
+            (u32::MAX, u32::MAX, PacketType::Close),
+            (0xCAFEBABE, 7, PacketType::Fec),
+            (1, 1, PacketType::Keepalive),
+        ] {
+            let mut h = PacketHeader::new(ptype, sid, seq);
+            h.ack_seq = seq.wrapping_mul(3);
+            h.ack_bitmap = seq.rotate_left(13);
+            h.fec_group = seq as u16;
+            h.fec_index = (seq % 251) as u8;
+            h.fec_k = 4;
+            h.fec_m = 2;
+            let frame = c.encode_frame(&h, b"payload");
+            let back = c.read_header(&frame).unwrap();
+            assert_eq!(back, h, "header must survive the seam");
+            assert_eq!(&frame[c.body_offset(&frame)..], b"payload");
+            assert_eq!(c.encode_header(&back), c.encode_header(&h));
+            assert_eq!(c.peek_session_id(&frame), Some(sid));
+        }
+    }
+
+    #[test]
     fn box_clone_is_a_deep_enough_copy() {
         let a: Box<dyn FrameCodec> = Box::new(V1FixedCodec::new());
         let b = a.box_clone();
         assert_eq!(a.name(), b.name());
         assert_eq!(a.wire_id(), b.wire_id());
+    }
+
+    #[test]
+    fn the_codec_agnostic_peek_agrees_with_the_single_codec_peek() {
+        let c = V1FixedCodec::new();
+        let buf = c.encode_frame(&sample(), b"body");
+        assert_eq!(peek_any_session_id(&buf), c.peek_session_id(&buf));
+        assert!(any_codec_claims(&buf));
+    }
+
+    #[test]
+    fn the_codec_agnostic_peek_rejects_noise() {
+        assert_eq!(peek_any_session_id(&[]), None);
+        assert_eq!(
+            peek_any_session_id(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+            None
+        );
+        assert!(!any_codec_claims(&[0xFF; 32]));
+    }
+
+    /// The routing peek must be unambiguous: a frame one codec produced must
+    /// not be claimed by a *different* one, or the server would route it to the
+    /// wrong session. Pinned by requiring distinct discriminators.
+    #[test]
+    fn every_codec_has_a_distinct_wire_discriminator() {
+        let mut seen = std::collections::HashMap::new();
+        for make in ALL_CODECS {
+            let c = make();
+            let probe = c.encode_frame(&sample(), b"");
+            // The first two bytes are each codec's discriminator.
+            let key = (&probe[..c.route_prefix_len().min(2)]).to_vec();
+            if let Some(prev) = seen.insert(key.clone(), c.name()) {
+                panic!(
+                    "{} and {} share a wire prefix {key:?}; a routing peek could \
+                     not tell them apart",
+                    prev,
+                    c.name()
+                );
+            }
+            // And a frame from one codec must not be claimed by another.
+            for other in ALL_CODECS {
+                let o = other();
+                if o.name() == c.name() {
+                    continue;
+                }
+                assert!(
+                    !o.looks_like_frame(&probe)
+                        || o.peek_session_id(&probe) == c.peek_session_id(&probe),
+                    "{} claims a frame produced by {}",
+                    o.name(),
+                    c.name()
+                );
+            }
+        }
     }
 
     #[test]
