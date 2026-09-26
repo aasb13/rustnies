@@ -2502,17 +2502,6 @@ async fn a_v1_only_server_answers_a_proposing_client_with_v1_fixed() {
     let client_kp = KeyPair::generate();
 
     // Server: v1-fixed only, no propose (it has nothing to negotiate).
-    let server_profile = LocalProfile::from_role_config(
-        &Default::default(),
-        &Default::default(),
-        &Default::default(),
-        &Default::default(),
-        &Default::default(),
-        &rustnies::config::FrameConfig {
-            codec: vec!["v1-fixed".into()],
-        },
-    )
-    .unwrap();
 
     // Client: prefers TLV, falls back to v1-fixed, and proposes.
     let client_profile = LocalProfile::from_role_config(
@@ -2686,18 +2675,6 @@ async fn a_non_proposing_client_gets_the_servers_first_codec() {
 
     let server_kp = KeyPair::generate();
     let client_kp = KeyPair::generate();
-    let server_profile = LocalProfile::from_role_config(
-        &Default::default(),
-        &Default::default(),
-        &Default::default(),
-        &Default::default(),
-        &Default::default(),
-        &rustnies::config::FrameConfig {
-            codec: vec!["v1-fixed".into(), "v2-tlv".into()],
-        },
-    )
-    .unwrap();
-
     let server_handle = {
         let kp = clone_keypair(&server_kp);
         let carrier = server_carrier.clone();
