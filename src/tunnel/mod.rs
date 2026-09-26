@@ -1260,7 +1260,7 @@ impl Tunnel {
         // peer (who shares this direction's key) could have produced a packet
         // that decrypts here, so a successful decrypt is proof of identity
         // independent of the source address.
-        if from != self.peer {
+        if from != self.peer && self.carrier.supports_roaming() {
             tracing::info!(
                 old_peer = %self.peer,
                 new_peer = %from,
@@ -1276,6 +1276,18 @@ impl Tunnel {
                     );
                 }
             }
+        } else if from != self.peer {
+            // A non-roaming carrier (a stream) is pinned, so a differing source
+            // address means the bytes did not come from this session's carrier
+            // at all. Trusting it would repoint the session at an address the
+            // carrier cannot reach. Log it; the AEAD tag already passed, so this
+            // is a misrouted frame rather than an attack.
+            tracing::warn!(
+                expected = %self.peer,
+                got = %from,
+                carrier = self.carrier.name(),
+                "frame source address differs from the pinned peer; ignoring for routing"
+            );
         }
 
         // Any successfully decrypted packet counts as peer activity for the

@@ -397,9 +397,6 @@ struct ServerCtx {
     tun_mtu: u32,
     fec_config: crate::config::FecConfig,
     max_sessions_per_peer: u8,
-    /// Whether sessions behind this server can roam (datagram carriers can,
-    /// stream carriers cannot). Read by the spawned tunnel.
-    roaming: bool,
 }
 
 /// The carrier a datagram server answers from, if it has one.
@@ -581,7 +578,6 @@ pub async fn run_server(
         tun_mtu,
         fec_config: fec_config.clone(),
         max_sessions_per_peer,
-        roaming: listener.preserves_boundaries(),
     };
 
     // NOTE: no `biased` here on purpose (same reason as `Tunnel::run`):

@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustnies::carrier::{Carrier, UdpCarrier, UdpListener};
+use rustnies::carrier::{Carrier, TcpCarrier, UdpCarrier, UdpListener};
 use rustnies::crypto::aead::Direction;
 use rustnies::crypto::keys::KeyPair;
 use rustnies::crypto::noise::{HandshakeRole, NoiseHandshake};
@@ -24,7 +24,7 @@ use rustnies::transport::default_transport;
 use rustnies::tun::{Tun, TunFactory, TunFut};
 use rustnies::tunnel::{Tunnel, TunnelExit, handshake};
 
-use tokio::net::UdpSocket;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc, watch};
 
 /// Wrap a raw test socket as a UDP carrier.
@@ -74,6 +74,56 @@ impl Tun for MemTun {
     }
     fn mtu(&self) -> std::io::Result<u32> {
         Ok(self.mtu)
+    }
+}
+
+impl MemTun {
+    /// Build a MemTun plus the two ends the test drives it with.
+    ///
+    /// Returns `(tun, inject, rx)`: `inject` feeds packets *into* the tunnel
+    /// (as if they arrived from the OS), and `rx` receives packets the tunnel
+    /// wrote *out* to the OS.
+    fn pair(
+        name: &str,
+        mtu: u32,
+    ) -> (
+        Box<dyn Tun>,
+        mpsc::UnboundedSender<Vec<u8>>,
+        mpsc::UnboundedReceiver<Vec<u8>>,
+    ) {
+        let (outbound, rx) = mpsc::unbounded_channel(); // tunnel -> OS
+        let (inject, inbound) = mpsc::unbounded_channel(); // OS -> tunnel
+        (
+            Box::new(MemTun {
+                name: name.to_string(),
+                mtu,
+                tx: outbound,
+                rx: Mutex::new(inbound),
+            }),
+            inject,
+            rx,
+        )
+    }
+}
+
+/// Feed a tunnel from a carrier, exactly as the daemon's reader task does.
+///
+/// The daemon's client-side reader is `socket_reader` over a [`Carrier`], so
+/// this is the same shape for every carrier. The source address travels with
+/// each message because the tunnel's roaming logic consumes it.
+async fn carrier_reader(carrier: Arc<dyn Carrier>, tx: mpsc::Sender<(Vec<u8>, SocketAddr)>) {
+    loop {
+        match carrier.recv().await {
+            Ok((data, from)) => {
+                if tx.send((data.to_vec(), from)).await.is_err() {
+                    break; // tunnel gone
+                }
+            }
+            Err(e) => {
+                eprintln!("carrier_reader exiting: {e:?}");
+                break;
+            }
+        }
     }
 }
 
@@ -1910,4 +1960,344 @@ async fn data_flows_over_a_non_default_negotiated_profile() {
     let _ = server_stop_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), client_task).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), server_task).await;
+}
+
+// ---------------------------------------------------------------------------
+// Carrier: a full session over TCP rather than UDP
+// ---------------------------------------------------------------------------
+
+/// An accepted loopback TCP connection, as `(server_side, client_side)`.
+///
+/// Done through `std` and converted to tokio, so the connection is fully
+/// established before any await point. The listener is dropped: these tests
+/// exercise the steady-state carrier, not `accept`.
+fn tcp_pair() -> (TcpStream, TcpStream) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = std::net::TcpStream::connect(addr).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    client.set_nonblocking(true).unwrap();
+    server.set_nonblocking(true).unwrap();
+    (
+        TcpStream::from_std(server).unwrap(),
+        TcpStream::from_std(client).unwrap(),
+    )
+}
+
+/// The handshake must complete over a length-delimited stream, not just a
+/// datagram socket. This is the test that would fail if the carrier seam leaked
+/// a datagram assumption into the handshake path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handshake_completes_over_a_tcp_carrier() {
+    let (server_stream, client_stream) = tcp_pair();
+    let server_addr = server_stream.local_addr().unwrap();
+    let client_addr = client_stream.local_addr().unwrap();
+
+    let server_carrier: Arc<dyn Carrier> =
+        Arc::new(TcpCarrier::new(server_stream, client_addr).unwrap());
+    let client_carrier: Arc<dyn Carrier> =
+        Arc::new(TcpCarrier::new(client_stream, server_addr).unwrap());
+
+    let server_kp = KeyPair::generate();
+    let client_kp = KeyPair::generate();
+
+    let server_handle = {
+        let kp = clone_keypair(&server_kp);
+        let carrier = server_carrier.clone();
+        tokio::spawn(async move {
+            handshake::server(carrier, kp, default_profile(), &ObfuscationStack::new())
+                .await
+                .expect("server handshake failed over tcp")
+        })
+    };
+
+    let established_client = tokio::time::timeout(
+        Duration::from_secs(5),
+        handshake::client(
+            client_carrier.clone(),
+            server_addr,
+            &client_kp,
+            server_kp.public,
+            &default_profile(),
+            &ObfuscationStack::new(),
+        ),
+    )
+    .await
+    .expect("client handshake timed out over tcp")
+    .expect("client handshake failed over tcp");
+
+    let established_server = tokio::time::timeout(Duration::from_secs(5), server_handle)
+        .await
+        .expect("server join timed out")
+        .expect("server task panicked");
+
+    assert_eq!(
+        established_client.send_key, established_server.recv_key,
+        "client send key == server recv key over tcp"
+    );
+    assert_eq!(
+        established_client.recv_key, established_server.send_key,
+        "client recv key == server send key over tcp"
+    );
+    assert_eq!(
+        established_client.session_id, established_server.session_id,
+        "session ids match over tcp"
+    );
+}
+
+/// A steady-state tunnel over TCP: real handshake, real tunnels, data both ways.
+///
+/// The tunnels are driven directly (not via `run_server`) so the test isolates
+/// the carrier: everything except the byte pipe is the production code path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_flows_in_both_directions_over_a_tcp_carrier() {
+    let (server_stream, client_stream) = tcp_pair();
+    let server_addr = server_stream.local_addr().unwrap();
+    let client_addr = client_stream.local_addr().unwrap();
+
+    let server_carrier: Arc<dyn Carrier> =
+        Arc::new(TcpCarrier::new(server_stream, client_addr).unwrap());
+    let client_carrier: Arc<dyn Carrier> =
+        Arc::new(TcpCarrier::new(client_stream, server_addr).unwrap());
+
+    let server_kp = KeyPair::generate();
+    let client_kp = KeyPair::generate();
+
+    // --- handshake -------------------------------------------------------
+    let server_handle = {
+        let kp = clone_keypair(&server_kp);
+        let carrier = server_carrier.clone();
+        tokio::spawn(async move {
+            handshake::server(carrier, kp, default_profile(), &ObfuscationStack::new())
+                .await
+                .expect("server handshake failed over tcp")
+        })
+    };
+    let established_client = tokio::time::timeout(
+        Duration::from_secs(5),
+        handshake::client(
+            client_carrier.clone(),
+            server_addr,
+            &client_kp,
+            server_kp.public,
+            &default_profile(),
+            &ObfuscationStack::new(),
+        ),
+    )
+    .await
+    .expect("client handshake timed out")
+    .expect("client handshake failed");
+    let established_server = tokio::time::timeout(Duration::from_secs(5), server_handle)
+        .await
+        .expect("server join timed out")
+        .expect("server task panicked");
+
+    // --- tunnels ---------------------------------------------------------
+    // Each side gets a MemTun plus a reader task pulling whole messages off
+    // the carrier, exactly as the daemon wires a UDP client.
+    let (client_tun, client_inject, mut client_rx) = MemTun::pair("rustnies0", 1400);
+    let (server_tun, server_inject, mut server_rx) = MemTun::pair("rustnies", 1400);
+
+    let mut client_tunnel = Tunnel::from_handshake(
+        client_tun,
+        client_carrier.clone(),
+        established_client.peer,
+        Session::new(established_client.session_id, SessionRole::Initiator),
+        resolved_profile(&default_profile(), &established_client),
+        ObfuscationStack::new(),
+        established_client.send_key,
+        established_client.recv_key,
+        established_client.send_dir,
+        established_client.recv_dir,
+        Arc::new(Mutex::new(Counters::new())),
+    )
+    .unwrap();
+    let mut server_tunnel = Tunnel::from_handshake(
+        server_tun,
+        server_carrier.clone(),
+        established_server.peer,
+        Session::new(established_server.session_id, SessionRole::Responder),
+        resolved_profile(&default_profile(), &established_server),
+        ObfuscationStack::new(),
+        established_server.send_key,
+        established_server.recv_key,
+        established_server.send_dir,
+        established_server.recv_dir,
+        Arc::new(Mutex::new(Counters::new())),
+    )
+    .unwrap();
+
+    let (c_tx, c_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1024);
+    let (s_tx, s_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1024);
+    let c_reader = tokio::spawn(carrier_reader(client_carrier.clone(), c_tx));
+    let s_reader = tokio::spawn(carrier_reader(server_carrier.clone(), s_tx));
+    let (_c_stop_tx, c_stop_rx) = watch::channel(false);
+    let (_s_stop_tx, s_stop_rx) = watch::channel(false);
+
+    let c_run = tokio::spawn(async move { client_tunnel.run(c_stop_rx, c_rx).await });
+    let s_run = tokio::spawn(async move { server_tunnel.run(s_stop_rx, s_rx).await });
+
+    // --- client -> server ------------------------------------------------
+    client_inject
+        .send(vec![
+            0x45, 0, 0, 20, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 40, 1, 10, 7, 0, 2,
+        ])
+        .unwrap();
+    let to_server = tokio::time::timeout(Duration::from_secs(5), server_rx.recv())
+        .await
+        .expect("server did not receive the client packet over tcp")
+        .expect("server tun channel closed");
+    assert_eq!(
+        to_server[0], 0x45,
+        "server saw the client's inner IP packet"
+    );
+    assert_eq!(to_server.len(), 20);
+
+    // --- server -> client ------------------------------------------------
+    server_inject
+        .send(vec![
+            0x45, 0, 0, 20, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 40, 1, 10, 7, 0, 3,
+        ])
+        .unwrap();
+    let to_client = tokio::time::timeout(Duration::from_secs(5), client_rx.recv())
+        .await
+        .expect("client did not receive the server packet over tcp")
+        .expect("client tun channel closed");
+    assert_eq!(
+        to_client[0], 0x45,
+        "client saw the server's inner IP packet"
+    );
+    assert_eq!(to_client.len(), 20);
+
+    c_run.abort();
+    s_run.abort();
+    c_reader.abort();
+    s_reader.abort();
+}
+
+/// A full-MTU packet must survive TCP's stream framing. This is the case a
+/// datagram carrier gets for free and a stream carrier must reassemble: the
+/// payload spans several reads, and the 2-byte length prefix is the only thing
+/// delimiting it.
+///
+/// Runs both tunnels, because the point is that a large frame crosses a real
+/// stream in both directions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_mtu_packet_survives_tcp_stream_framing() {
+    let (server_stream, client_stream) = tcp_pair();
+    let server_addr = server_stream.local_addr().unwrap();
+    let client_addr = client_stream.local_addr().unwrap();
+
+    let server_carrier: Arc<dyn Carrier> =
+        Arc::new(TcpCarrier::new(server_stream, client_addr).unwrap());
+    let client_carrier: Arc<dyn Carrier> =
+        Arc::new(TcpCarrier::new(client_stream, server_addr).unwrap());
+
+    let server_kp = KeyPair::generate();
+    let client_kp = KeyPair::generate();
+    let server_handle = {
+        let kp = clone_keypair(&server_kp);
+        let carrier = server_carrier.clone();
+        tokio::spawn(async move {
+            handshake::server(carrier, kp, default_profile(), &ObfuscationStack::new())
+                .await
+                .expect("server handshake failed")
+        })
+    };
+    let established_client = tokio::time::timeout(
+        Duration::from_secs(5),
+        handshake::client(
+            client_carrier.clone(),
+            server_addr,
+            &client_kp,
+            server_kp.public,
+            &default_profile(),
+            &ObfuscationStack::new(),
+        ),
+    )
+    .await
+    .expect("timed out")
+    .expect("client handshake failed");
+    let established_server = tokio::time::timeout(Duration::from_secs(5), server_handle)
+        .await
+        .expect("server join timed out")
+        .expect("server task panicked");
+
+    // FEC off, so the frame on the wire is exactly one packet plus its
+    // header/tag: no parity symbols to confuse the byte count.
+    let profile = |e: &handshake::SessionEstablished| {
+        let mut p = resolved_profile(&default_profile(), e);
+        p.fec = Box::new(rustnies::fec::NoFec);
+        p
+    };
+
+    let (client_tun, client_inject, _client_rx) = MemTun::pair("rustnies0", 1400);
+    let (server_tun, _server_inject, mut server_rx) = MemTun::pair("rustnies", 1400);
+
+    let mut client_tunnel = Tunnel::from_handshake(
+        client_tun,
+        client_carrier.clone(),
+        established_client.peer,
+        Session::new(established_client.session_id, SessionRole::Initiator),
+        profile(&established_client),
+        ObfuscationStack::new(),
+        established_client.send_key,
+        established_client.recv_key,
+        established_client.send_dir,
+        established_client.recv_dir,
+        Arc::new(Mutex::new(Counters::new())),
+    )
+    .unwrap();
+    let mut server_tunnel = Tunnel::from_handshake(
+        server_tun,
+        server_carrier.clone(),
+        established_server.peer,
+        Session::new(established_server.session_id, SessionRole::Responder),
+        profile(&established_server),
+        ObfuscationStack::new(),
+        established_server.send_key,
+        established_server.recv_key,
+        established_server.send_dir,
+        established_server.recv_dir,
+        Arc::new(Mutex::new(Counters::new())),
+    )
+    .unwrap();
+
+    let (c_tx, c_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1024);
+    let (s_tx, s_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1024);
+    let c_reader = tokio::spawn(carrier_reader(client_carrier.clone(), c_tx));
+    let s_reader = tokio::spawn(carrier_reader(server_carrier.clone(), s_tx));
+    let (_c_stop, c_stop_rx) = watch::channel(false);
+    let (_s_stop, s_stop_rx) = watch::channel(false);
+    let c_run = tokio::spawn(async move { client_tunnel.run(c_stop_rx, c_rx).await });
+    let s_run = tokio::spawn(async move { server_tunnel.run(s_stop_rx, s_rx).await });
+
+    // The largest inner packet the protocol carries: MAX_PAYLOAD is
+    // 1400 - HEADER_LEN(24) - AEAD_TAG_LEN(16) = 1360, and the tunnel drops
+    // anything above it. So this is exactly at the limit, which is the
+    // interesting case: one byte more and the tunnel refuses to send it.
+    let mut big = vec![0u8; 1360];
+    big[0] = 0x45;
+    let total = u16::from_be_bytes([0x05, 0x50]); // 1360
+    big[2..4].copy_from_slice(&total.to_be_bytes());
+    for (i, b) in big.iter_mut().enumerate().skip(20) {
+        *b = (i % 251) as u8; // a non-uniform pattern, so a misframed byte shows
+    }
+    client_inject.send(big.clone()).unwrap();
+
+    let got = tokio::time::timeout(Duration::from_secs(5), server_rx.recv())
+        .await
+        .expect("full-MTU packet never arrived over tcp")
+        .expect("tun channel closed");
+    assert_eq!(
+        got.len(),
+        big.len(),
+        "packet length preserved across stream framing"
+    );
+    assert_eq!(got, big, "packet bytes preserved across stream framing");
+
+    c_run.abort();
+    s_run.abort();
+    c_reader.abort();
+    s_reader.abort();
 }
